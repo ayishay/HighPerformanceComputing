@@ -1,1348 +1,1499 @@
-# Building a High Performance Computing Cluster for Training and Serving LLMs
+# Building a High Performance Computing Cluster for LLM Training and Inference
 
 ## What Are We Building?
 
-We are building a **GPU cluster** — a group of powerful servers connected together — that can:
-1. **Train** large language models (like LLaMA 70B, GPT-4 scale)
-2. **Serve** (inference) those models to users via an API
+We are building a **GPU cluster** — a group of powerful servers connected together — specifically designed to train and serve large language models (like LLaMA, GPT, etc.). Here is the technology stack we will use:
 
-Our technology choices:
-- **GPUs with NVLink** — for fast GPU-to-GPU communication inside each server
-- **InfiniBand** — for fast server-to-server communication across the cluster
-- **NCCL** — the communication library that moves data between GPUs efficiently
-- **Kubernetes** — the scheduler that manages which jobs run on which GPUs
+| Component | Technology | Role |
+|-----------|-----------|------|
+| **Compute** | NVIDIA GPUs (H100) | The "brains" — do all the math for training/inference |
+| **Intra-node connection** | NVLink / NVSwitch | Super-fast cable connecting GPUs **inside** a single server |
+| **Inter-node connection** | InfiniBand (IB) | Super-fast network connecting **different servers** together |
+| **Communication library** | NCCL | Software that moves data between GPUs efficiently |
+| **Scheduler** | Kubernetes (K8s) | Software that decides which jobs run on which GPUs |
 
-> **Important clarification:** NCCL is a **communication library**, not an accelerator. The GPUs are the accelerators (they do the actual math). NCCL is the software that helps GPUs talk to each other. Think of GPUs as workers and NCCL as the phone system they use to coordinate.
+**Important clarification:** NCCL is **not** an accelerator — it is a **communication library**. The GPUs are the accelerators (they accelerate the math). NCCL is the software that helps GPUs talk to each other. Think of it this way:
+- **GPUs** = workers doing the heavy lifting
+- **NVLink / InfiniBand** = roads between workers
+- **NCCL** = the traffic management system that moves data on those roads as efficiently as possible
+- **Kubernetes** = the manager who assigns work to workers
 
 ---
 
 ## The Big Picture: What Does the Cluster Look Like?
 
-Before diving into details, here's the full picture of what we're building:
+Before diving into details, let's see the full picture of what we're building:
 
 ```
-                         ┌──────────────────────────────┐
-                         │      Users / Applications     │
-                         │   (send training jobs or       │
-                         │    inference requests)         │
-                         └──────────────┬───────────────┘
-                                        │
-                                        ▼
-                         ┌──────────────────────────────┐
-                         │    Kubernetes Control Plane    │
-                         │  (the "brain" that decides     │
-                         │   what runs where)             │
-                         │                                │
-                         │  API Server ← you talk to this │
-                         │  Scheduler  ← places jobs      │
-                         │  etcd       ← remembers state  │
-                         └──────────────┬───────────────┘
-                                        │
-                    ┌───────────────────┼───────────────────┐
-                    │                   │                   │
-                    ▼                   ▼                   ▼
-        ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐
-        │   GPU Server 0    │ │   GPU Server 1    │ │   GPU Server N    │
-        │                   │ │                   │ │                   │
-        │  ┌─────────────┐  │ │  ┌─────────────┐  │ │  ┌─────────────┐  │
-        │  │ 8× GPUs     │  │ │  │ 8× GPUs     │  │ │  │ 8× GPUs     │  │
-        │  │ connected by │  │ │  │ connected by │  │ │  │ connected by │  │
-        │  │ NVLink      │  │ │  │ NVLink      │  │ │  │ NVLink      │  │
-        │  └─────────────┘  │ │  └─────────────┘  │ │  └─────────────┘  │
-        │  CPU + RAM + SSD  │ │  CPU + RAM + SSD  │ │  CPU + RAM + SSD  │
-        │  InfiniBand NIC   │ │  InfiniBand NIC   │ │  InfiniBand NIC   │
-        └────────┬──────────┘ └────────┬──────────┘ └────────┬──────────┘
-                 │                     │                     │
-                 └─────────────────────┼─────────────────────┘
-                                       │
-                          ┌────────────▼────────────┐
-                          │   InfiniBand Network    │
-                          │  (high-speed switches    │
-                          │   connecting all servers) │
-                          └────────────┬────────────┘
-                                       │
-                          ┌────────────▼────────────┐
-                          │   Shared Storage         │
-                          │  (Lustre / NFS / S3)     │
-                          │  Training data, models,  │
-                          │  checkpoints             │
-                          └─────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        OUR HPC CLUSTER                              │
+│                                                                     │
+│  ┌─────────── Kubernetes Control Plane ──────────┐                  │
+│  │  API Server │ Scheduler │ etcd │ Controllers  │                  │
+│  └──────────────────────┬────────────────────────┘                  │
+│                         │ (manages everything)                      │
+│                         │                                           │
+│  ═══════════════════════╪═══════════════════════════════            │
+│  ║           InfiniBand Network Fabric (400 Gb/s)     ║            │
+│  ║    (super-fast network connecting all servers)      ║            │
+│  ═══╤══════════╤══════════╤══════════╤════════════════             │
+│     │          │          │          │                              │
+│  ┌──▼────┐ ┌──▼────┐ ┌──▼────┐ ┌──▼────┐                         │
+│  │Server │ │Server │ │Server │ │Server │  ... more servers         │
+│  │Node 0 │ │Node 1 │ │Node 2 │ │Node 3 │                          │
+│  │       │ │       │ │       │ │       │                           │
+│  │8 GPUs │ │8 GPUs │ │8 GPUs │ │8 GPUs │  (8 GPUs per server)     │
+│  │  ↕↕↕  │ │  ↕↕↕  │ │  ↕↕↕  │ │  ↕↕↕  │                         │
+│  │NVLink │ │NVLink │ │NVLink │ │NVLink │  (GPUs talk inside)      │
+│  └───────┘ └───────┘ └───────┘ └───────┘                          │
+│     │          │          │          │                              │
+│  ═══╧══════════╧══════════╧══════════╧════════════════             │
+│  ║         Shared Storage (Lustre / NFS / Ceph)       ║            │
+│  ║    (training data + model checkpoints live here)    ║            │
+│  ═════════════════════════════════════════════════════              │
+│                                                                     │
+│  NCCL runs on every GPU, managing all data movement                │
+│  between GPUs (both inside servers via NVLink and                  │
+│  across servers via InfiniBand)                                    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**In plain English:** We have multiple powerful servers, each packed with 8 GPUs. Inside each server, GPUs talk to each other through NVLink (super fast, like a private highway). Between servers, they talk through InfiniBand (very fast, like an express highway — much faster than regular Ethernet). Kubernetes sits on top and decides which server runs which job. NCCL is the software running on each GPU that figures out the fastest way to send data to other GPUs.
+**In plain English:** We have multiple powerful servers (called "nodes"), each stuffed with 8 GPUs. Inside each server, the GPUs are connected to each other with ultra-fast NVLink cables. The servers themselves are connected to each other with InfiniBand networking. NCCL is software running on every GPU that figures out the fastest way to move data around. Kubernetes sits on top and decides which training/inference jobs run where.
 
 ---
 
-## Step 1: Choose and Set Up the Hardware
+## Part 1: The Hardware Layer
 
-### 1.1 GPU Servers (Compute Nodes)
+### 1.1 Choosing the GPU Servers (Nodes)
 
-Each server in our cluster is a powerful machine packed with GPUs. For LLM work, we want servers with **8 GPUs per server** because that's the standard configuration that maximizes NVLink connectivity.
+Each server in our cluster is a powerful machine packed with GPUs. The most common choice for LLM training is the **NVIDIA DGX H100** or an equivalent server from companies like Supermicro, Dell, or Lenovo.
 
-**Recommended server options:**
-
-| Server | GPUs | GPU Memory | NVLink | InfiniBand | Use Case |
-|--------|------|-----------|--------|------------|----------|
-| NVIDIA DGX H100 | 8× H100 SXM | 80 GB HBM3 each | NVSwitch (900 GB/s all-to-all) | 8× ConnectX-7 (400 Gb/s each) | Frontier training |
-| NVIDIA DGX A100 | 8× A100 SXM | 80 GB HBM2e each | NVSwitch (600 GB/s all-to-all) | 8× ConnectX-6 (200 Gb/s each) | Production training |
-| Custom build | 8× H100 PCIe | 80 GB HBM3 each | NVLink Bridge (pairs only) | 1-2× ConnectX-7 | Budget option |
-
-**What's inside each server:**
+**What's inside ONE server node:**
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    One GPU Server (Node)                      │
-│                                                              │
-│  CPUs: 2× AMD EPYC 9654 (96 cores each = 192 cores total)  │
-│  ──────────────────────────────────────────────────────────  │
-│  Why? CPUs handle:                                           │
-│    - Data loading and preprocessing (tokenization)           │
-│    - Orchestrating GPU kernels                               │
-│    - Running Kubernetes kubelet agent                        │
-│    - Network stack management                                │
-│                                                              │
-│  RAM: 2 TB DDR5                                              │
-│  ──────────────────────────────────────────────────────────  │
-│  Why? LLM training needs lots of CPU RAM for:               │
-│    - Data loading buffers (hold next batches ready)          │
-│    - CPU offloading (ZeRO-Offload puts optimizer states here)│
-│    - Operating system and Kubernetes overhead                │
-│                                                              │
-│  Storage: 8× 3.84 TB NVMe SSDs (30 TB total)               │
-│  ──────────────────────────────────────────────────────────  │
-│  Why? Fast local storage for:                                │
-│    - Caching training data (faster than reading from network)│
-│    - Writing checkpoints quickly                             │
-│    - Container images (Kubernetes pulls images here)         │
-│                                                              │
-│  GPUs: 8× NVIDIA H100 SXM (80 GB HBM3 each)               │
-│  ──────────────────────────────────────────────────────────  │
-│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐                       │
-│  │GPU 0 │ │GPU 1 │ │GPU 2 │ │GPU 3 │                       │
-│  └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘                       │
-│     │        │        │        │                             │
-│  ═══╪════════╪════════╪════════╪═══  ← NVSwitch Fabric      │
-│     │        │        │        │       (900 GB/s any-to-any) │
-│  ┌──┴───┐ ┌──┴───┐ ┌──┴───┐ ┌──┴───┐                       │
-│  │GPU 4 │ │GPU 5 │ │GPU 6 │ │GPU 7 │                       │
-│  └──────┘ └──────┘ └──────┘ └──────┘                       │
-│                                                              │
-│  Network: 8× NVIDIA ConnectX-7 (InfiniBand 400 Gb/s each)  │
-│  ──────────────────────────────────────────────────────────  │
-│  Why 8 NICs? Each GPU gets its own dedicated network card!  │
-│  GPU 0 → NIC 0, GPU 1 → NIC 1, etc.                        │
-│  This means GPU 0 on Server A can send data directly to     │
-│  GPU 0 on Server B without going through the CPU.           │
-│  This is called "GPUDirect RDMA."                           │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    One Server Node                       │
+│                                                          │
+│  CPUs:  2× AMD EPYC 9654 (96 cores each = 192 total)   │
+│         → Handle data loading, preprocessing, and        │
+│           orchestrating the GPUs                         │
+│                                                          │
+│  RAM:   2 TB DDR5 system memory                          │
+│         → Holds training data batches before sending      │
+│           to GPUs                                        │
+│                                                          │
+│  GPUs:  8× NVIDIA H100 SXM (80 GB HBM3 each)           │
+│         → The actual workers that do the matrix math     │
+│         → 640 GB total GPU memory per server             │
+│                                                          │
+│  NVLink: NVSwitch connecting all 8 GPUs                  │
+│         → 900 GB/s between any two GPUs in this server   │
+│                                                          │
+│  NICs:  8× ConnectX-7 InfiniBand adapters (400 Gb/s)    │
+│         → One NIC per GPU for direct GPU-to-network      │
+│           communication (GPUDirect RDMA)                 │
+│                                                          │
+│  Storage: 8× 3.84 TB NVMe SSDs (local scratch)          │
+│         → Fast temporary storage for data during training │
+│                                                          │
+│  Power: ~10 kW per server (these are power-hungry!)      │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 Understanding NVLink: Why It Matters
+**Why 8 GPUs per server?** This is the sweet spot because:
+- NVLink/NVSwitch can connect up to 8 GPUs with full bandwidth
+- It matches the physical design of GPU baseboards (SXM form factor)
+- Most distributed training frameworks assume 8 GPUs per node
 
-**The problem NVLink solves:**
+**How many servers do we need?** That depends on the model size:
 
-GPUs inside the same server need to exchange data constantly during LLM training. Without NVLink, they'd communicate through PCIe (the standard connection):
+| Model Size | Minimum GPUs | Servers (8 GPUs each) | Why |
+|-----------|-------------|----------------------|-----|
+| 7B params | 1-8 | 1 | Fits on 1-2 GPUs (FP16: 14 GB) |
+| 13B params | 2-8 | 1 | Fits on 2 GPUs (FP16: 26 GB) |
+| 70B params | 16-64 | 2-8 | Parameters alone = 140 GB, plus optimizer states |
+| 405B params | 128-512 | 16-64 | Massive model, needs many GPUs |
+| Training 70B from scratch | 256-2048 | 32-256 | Need high throughput for trillions of tokens |
 
-```
-Without NVLink (PCIe only):
-  GPU 0 ──PCIe──► CPU ──PCIe──► GPU 1
-  Speed: ~64 GB/s (PCIe 5.0 x16)
-  Problem: CPU is a bottleneck. Data has to go through CPU memory.
+For this guide, let's build a **moderate cluster: 8 servers × 8 GPUs = 64 GPUs total**. This is enough to train a 70B model or serve multiple smaller models.
 
-With NVLink:
-  GPU 0 ══NVLink══► GPU 1
-  Speed: 900 GB/s (H100 NVSwitch)
-  Benefit: 14× faster! Data goes directly GPU-to-GPU.
-```
+---
 
-**NVLink vs NVSwitch — what's the difference?**
+### 1.2 NVLink: The Fast Lane Inside Each Server
 
-```
-NVLink (point-to-point):
-  Each GPU has a few direct NVLink connections to specific other GPUs.
-  Like having dedicated phone lines between specific people.
+**What is NVLink?**
 
-  GPU 0 ════ GPU 1
-  GPU 0 ════ GPU 2
-  GPU 0 ╳╳╳╳ GPU 7  (no direct link — must go through intermediary)
+NVLink is a proprietary high-speed connection created by NVIDIA that directly links GPUs together **inside a single server**. Think of it as a private highway between GPUs — much wider and faster than the regular PCIe "road" that connects GPUs to the CPU.
 
-NVSwitch (any-to-any):
-  A special chip that connects ALL GPUs to ALL other GPUs simultaneously.
-  Like a phone switchboard where anyone can call anyone at full speed.
+**Why do we need it?** During LLM training, GPUs inside the same server constantly exchange data (partial results, activations, weights). The faster this happens, the less time GPUs spend waiting, and the faster training goes.
 
-  GPU 0 ═╗
-  GPU 1 ═╬═══ NVSwitch ═══ All GPUs talk at 900 GB/s simultaneously
-  GPU 2 ═╣
-  ...    ║
-  GPU 7 ═╝
-
-  DGX H100 uses NVSwitch → every GPU pair gets full bandwidth.
-  This is critical for Tensor Parallelism where every GPU in a layer
-  must combine results after every operation.
-```
-
-**Why 900 GB/s matters for LLMs:**
-
-During tensor parallelism, after every transformer layer, all 8 GPUs must combine their partial results (all-reduce). With a 70B model:
+**Speed comparison:**
 
 ```
-Data to synchronize per layer: ~64 MB (hidden states)
-Number of layers: 80
-Synchronizations per step: 80 × 2 = 160 (forward + backward)
+Connection type:          Bandwidth:        Analogy:
+─────────────────────────────────────────────────────
+PCIe Gen5 x16             64 GB/s           → Country road
+NVLink 4.0 (H100)         900 GB/s          → 14-lane superhighway
+                          (14× faster!)
 
-Total data moved per step: 160 × 64 MB = 10.24 GB
-
-At 900 GB/s (NVSwitch): 10.24 GB / 900 GB/s = 11.4 ms  ✓ Fast!
-At 64 GB/s (PCIe only): 10.24 GB / 64 GB/s  = 160 ms   ✗ 14× slower!
-
-Those extra 149 ms PER STEP add up to hours/days over a full training run.
+That means: Data moves between GPUs 14× faster on NVLink
+compared to PCIe. For LLM training where GPUs are constantly
+exchanging gradients, this is a MASSIVE difference.
 ```
 
-### 1.3 InfiniBand Network: Connecting Servers Together
+**How NVSwitch works:**
 
-**The problem InfiniBand solves:**
-
-NVLink only works inside one server. But a 70B-parameter model needs more than 8 GPUs (one server). We need servers to talk to each other. Regular Ethernet is too slow:
+Without NVSwitch, NVLink connects GPUs in pairs — GPU 0 can talk fast to GPU 1, but talking to GPU 7 requires hopping through intermediate GPUs (slow). NVSwitch fixes this by acting as a central hub:
 
 ```
-Regular Ethernet (25-100 Gb/s):
-  Server 0 ──Ethernet──► Server 1
-  Speed: 3-12.5 GB/s
-  Latency: 10-50 microseconds
-  Problem: Way too slow for training. GPUs wait for data.
+WITHOUT NVSwitch (old way — daisy chain):
+  GPU 0 ↔ GPU 1 ↔ GPU 2 ↔ GPU 3
+  Problem: GPU 0 talking to GPU 3 must go through GPU 1 and GPU 2
+           (slow, adds latency)
 
-InfiniBand NDR (400 Gb/s per port):
-  Server 0 ══InfiniBand══► Server 1
-  Speed: 50 GB/s per port (×8 ports = 400 GB/s per server)
-  Latency: 1-2 microseconds
-  Benefit: 30-100× faster than Ethernet! Near-zero latency.
+WITH NVSwitch (our way — full mesh):
+              ┌─────────────────────────────┐
+              │         NVSwitch             │
+              │  (central hub — connects     │
+              │   ALL GPUs to ALL GPUs)      │
+              └─┬───┬───┬───┬───┬───┬───┬─┘
+                │   │   │   │   │   │   │
+              GPU0 GPU1 GPU2 GPU3 GPU4 GPU5 GPU6 GPU7
+
+  Now: GPU 0 can talk to GPU 7 directly at 900 GB/s
+       GPU 3 can talk to GPU 5 directly at 900 GB/s
+       ANY GPU can talk to ANY GPU at full speed simultaneously!
 ```
 
-**InfiniBand network topology:**
+**What uses NVLink in LLM training?**
 
-The InfiniBand switches connect all servers together. The topology (how switches are wired) matters a lot:
-
-```
-Fat-Tree Topology (most common for AI clusters):
-
-            ┌──────────┐ ┌──────────┐
-            │Core SW 0 │ │Core SW 1 │    ← Core layer (top)
-            └────┬┬────┘ └────┬┬────┘      Full bandwidth between
-                 ││           ││            any two servers
-            ┌────┘└────┐ ┌───┘└─────┐
-            ▼          ▼ ▼          ▼
-       ┌─────────┐ ┌─────────┐ ┌─────────┐
-       │Leaf SW 0│ │Leaf SW 1│ │Leaf SW 2│  ← Leaf layer (bottom)
-       └─┬─┬─┬─┬┘ └─┬─┬─┬─┬┘ └─┬─┬─┬─┬┘    Connected to servers
-         │ │ │ │     │ │ │ │     │ │ │ │
-         ▼ ▼ ▼ ▼     ▼ ▼ ▼ ▼     ▼ ▼ ▼ ▼
-        Servers      Servers      Servers
-
-Why fat-tree?
-  - "Non-blocking" = every server can talk to every other server
-    at full speed simultaneously
-  - No bottlenecks even when all servers communicate at once
-  - Critical for all-reduce operations during training
-```
-
-**Hardware you need:**
-- **InfiniBand Host Channel Adapters (HCAs)**: NVIDIA ConnectX-7 cards in each server
-- **InfiniBand Switches**: NVIDIA Quantum-2 NDR switches (400 Gb/s per port)
-- **InfiniBand Cables**: Fiber optic cables connecting servers to switches
-
-**GPUDirect RDMA: The Secret Sauce**
-
-The best part about combining InfiniBand with NVIDIA GPUs is **GPUDirect RDMA**. This lets GPU memory on Server A send data directly to GPU memory on Server B, completely bypassing the CPU:
+Tensor Parallelism — the technique where a single transformer layer is split across multiple GPUs. Each GPU computes part of the result, then they must combine their partial results. This combine step (called "all-reduce") happens **every single layer, every single step**. It must be ultra-fast, which is why it runs on NVLink.
 
 ```
-Without GPUDirect RDMA (old way):
-  GPU 0 (Server A)
-    │ copy to CPU RAM ← slow, wastes CPU time
-    ▼
-  CPU RAM (Server A)
-    │ send over InfiniBand
-    ▼
-  CPU RAM (Server B)
-    │ copy to GPU RAM ← slow again
-    ▼
-  GPU 0 (Server B)
+Example: One transformer layer with Tensor Parallelism across 8 GPUs
 
-  Total: 4 data copies, high latency, CPU busy doing nothing useful
-
-With GPUDirect RDMA (our setup):
-  GPU 0 (Server A)
-    │ direct send over InfiniBand ← GPU talks directly to NIC!
-    ▼
-  GPU 0 (Server B)
-
-  Total: 1 data transfer, minimal latency, CPU is free to do other work
-  This is possible because each GPU has its own dedicated InfiniBand NIC
+  Input tokens
+       │
+       ▼
+  ┌──────────────────────────────────────────┐
+  │  Attention layer: split across 8 GPUs     │
+  │                                           │
+  │  GPU 0: computes attention heads 0-7      │
+  │  GPU 1: computes attention heads 8-15     │
+  │  GPU 2: computes attention heads 16-23    │
+  │  ...                                      │
+  │  GPU 7: computes attention heads 56-63    │
+  │                                           │
+  │  Now they must COMBINE results:           │
+  │  ← All-Reduce over NVLink (900 GB/s) →   │
+  │  This takes ~0.1 ms because NVLink is     │
+  │  so fast                                  │
+  └──────────────────────────────────────────┘
+       │
+       ▼
+  Combined result → next layer
 ```
+
+---
+
+### 1.3 InfiniBand: The Fast Lane Between Servers
+
+**What is InfiniBand?**
+
+InfiniBand (IB) is a high-speed networking technology designed for HPC clusters. While your home network uses Ethernet (1-10 Gbps), InfiniBand runs at **400 Gbps per port** — 40 to 400 times faster than home Ethernet.
+
+**Why not just use regular Ethernet?** Three reasons:
+
+| Feature | Regular Ethernet | InfiniBand |
+|---------|-----------------|------------|
+| Bandwidth | 1-100 Gbps | 400 Gbps (NDR) |
+| Latency | ~50-500 microseconds | ~1 microsecond |
+| CPU overhead | High (CPU processes packets) | Near zero (RDMA bypasses CPU) |
+| GPU-direct | No | Yes (GPUDirect RDMA) |
+
+**RDMA (Remote Direct Memory Access)** — this is the killer feature. With regular Ethernet, data goes: GPU → CPU → RAM → NIC → Network → NIC → RAM → CPU → GPU. With InfiniBand RDMA, data goes: GPU → NIC → Network → NIC → GPU. The CPU is completely bypassed, saving massive overhead.
+
+```
+Regular Ethernet (slow, many copies):
+  GPU memory                              GPU memory
+      │                                       ▲
+      ▼ copy to CPU                           │ copy from CPU
+  CPU + RAM                               CPU + RAM
+      │                                       ▲
+      ▼ send                                  │ receive
+  Ethernet NIC ═══ network ═══ Ethernet NIC
+
+  Total: 4 memory copies, CPU involved at every step
+  Latency: ~100+ microseconds
+
+InfiniBand with GPUDirect RDMA (fast, zero copies through CPU):
+  GPU memory                              GPU memory
+      │                                       ▲
+      └──► IB NIC ═══ network ═══ IB NIC ────┘
+
+  Total: 0 CPU copies, data goes directly from GPU to network
+  Latency: ~1-2 microseconds
+```
+
+**InfiniBand Network Topology**
+
+Our cluster needs an InfiniBand "fabric" — the network of switches connecting all servers. The most common topology is a **fat-tree**, which ensures every server can talk to every other server at full speed:
+
+```
+                    ┌──────────┐ ┌──────────┐
+                    │Core SW 0 │ │Core SW 1 │    ← Core switches
+                    └────┬┬────┘ └────┬┬────┘      (top level)
+                     ┌───┘└───┐  ┌───┘└───┐
+                     │        │  │        │
+                ┌────▼──┐ ┌──▼──▼─┐ ┌────▼──┐
+                │Leaf 0 │ │Leaf 1 │ │Leaf 2 │    ← Leaf switches
+                └┬┬┬┬───┘ └┬┬┬┬──┘ └┬┬┬┬───┘      (connect to servers)
+                 ││││      ││││     ││││
+              ┌──┘│││   ┌──┘│││  ┌──┘│││
+              │ ┌─┘││   │ ┌─┘││  │ ┌─┘││
+              │ │┌─┘│   │ │┌─┘│  │ │┌─┘│
+              │ ││ ┌┘   │ ││ ┌┘  │ ││ ┌┘
+              ▼ ▼▼ ▼    ▼ ▼▼ ▼   ▼ ▼▼ ▼
+             Servers   Servers   Servers
+
+Fat-tree ensures:
+- Every server can reach every other server
+- Full bisection bandwidth (no bottleneck at the top)
+- If one switch fails, traffic re-routes automatically
+```
+
+**Hardware shopping list for InfiniBand:**
+
+For our 8-server cluster with 8 NICs per server (one per GPU):
+
+| Component | Quantity | Purpose |
+|-----------|----------|---------|
+| NVIDIA ConnectX-7 NICs (400 Gb/s) | 64 (8 per server) | Connect each GPU to the network |
+| NVIDIA QM9700 leaf switches (64-port 400 Gb/s) | 2 | Connect servers to network |
+| NVIDIA QM9700 core switches | 2 | Connect leaf switches (for full bisection BW) |
+| InfiniBand cables (400 Gb/s) | ~80 | Connect everything together |
+
+**Why one NIC per GPU?** This enables GPUDirect RDMA — each GPU has its own dedicated network port. When GPU 3 on Server 0 needs to send data to GPU 3 on Server 5, it goes directly through its own NIC without competing for bandwidth with other GPUs.
+
+```
+Server 0:                              Server 1:
+┌────────────────────────┐             ┌────────────────────────┐
+│ GPU 0 → NIC 0 ─────────╫─── IB ────╫── NIC 0 ← GPU 0       │
+│ GPU 1 → NIC 1 ─────────╫─── IB ────╫── NIC 1 ← GPU 1       │
+│ GPU 2 → NIC 2 ─────────╫─── IB ────╫── NIC 2 ← GPU 2       │
+│ ...                     │           │                  ...    │
+│ GPU 7 → NIC 7 ─────────╫─── IB ────╫── NIC 7 ← GPU 7       │
+└────────────────────────┘             └────────────────────────┘
+
+Each GPU has its own private 400 Gb/s (50 GB/s) link to the network.
+8 GPUs × 50 GB/s = 400 GB/s total bandwidth per server.
+```
+
+---
 
 ### 1.4 Shared Storage
 
-All servers need access to the same data (training datasets, model checkpoints). We need a **shared file system** that every server can read/write.
+All servers need access to the same training data and model checkpoints. We use a **parallel file system** that all nodes can read/write simultaneously.
 
 ```
 Options:
 
-1. Lustre (Parallel File System)
-   ┌────────┐ ┌────────┐ ┌────────┐
-   │Storage │ │Storage │ │Storage │   ← Multiple storage servers
-   │Server 0│ │Server 1│ │Server 2│      with many hard drives
-   └───┬────┘ └───┬────┘ └───┬────┘
-       └──────────┼──────────┘
-                  │
-       InfiniBand / Ethernet
-                  │
-       ┌──────────┼──────────┐
-       ▼          ▼          ▼
-   Server 0   Server 1   Server N     ← All compute servers see
-   (sees /data) (sees /data) (sees /data)  the same /data directory
-
-   Speed: 100+ GB/s aggregate (data spread across many servers)
-   Best for: Large training datasets (terabytes)
-   Used by: Most HPC clusters, national labs
-
-2. NFS (Network File System)
-   Simpler but slower. One server shares a directory.
-   Speed: 1-10 GB/s (bottlenecked by single server)
-   Best for: Small clusters, config files, code
-
-3. S3-compatible object storage (MinIO, Ceph)
-   Cloud-style storage. Good for Kubernetes-native workflows.
-   Speed: Variable, depends on setup
-   Best for: Cloud-hybrid setups, model artifact storage
+┌───────────────────────────────────────────────────────────┐
+│  Storage Type       │ Speed       │ Best For              │
+├───────────────────────────────────────────────────────────┤
+│  Lustre             │ Very fast   │ Large-scale training  │
+│  (parallel FS)      │ 100+ GB/s   │ data, checkpoints     │
+│                     │ aggregate   │                       │
+├───────────────────────────────────────────────────────────┤
+│  Ceph / CephFS      │ Fast        │ K8s-native storage,   │
+│  (distributed)      │ 10-50 GB/s  │ persistent volumes    │
+├───────────────────────────────────────────────────────────┤
+│  NFS                │ Moderate    │ Config files, small   │
+│  (simple)           │ 1-10 GB/s   │ datasets, home dirs   │
+├───────────────────────────────────────────────────────────┤
+│  Local NVMe SSDs    │ Fastest     │ Temporary scratch,    │
+│  (per-node)         │ 7+ GB/s     │ cached datasets       │
+│                     │ per node    │                       │
+└───────────────────────────────────────────────────────────┘
 ```
 
-**Recommended approach:**
-- **Lustre** for training data and checkpoints (fast, parallel)
-- **NFS** for code, configs, and small files (simple, easy to set up)
-- **Local NVMe** on each server for caching (fastest, but not shared)
-
-### 1.5 Cluster Size Planning
-
-How many servers do you need? It depends on the model size:
+**Practical approach:** Use Lustre or Ceph for shared data, and local NVMe for caching:
 
 ```
-Example: Training LLaMA 70B
+Training data flow:
 
-Model memory requirements (per GPU, with different parallelism):
-  Parameters (BF16):           140 GB
-  Optimizer states (Adam):     560 GB (4× parameters)
-  Gradients (BF16):            140 GB
-  Activations:                 ~50-100 GB (depends on batch size)
-  ─────────────────────────────────────
-  Total:                       ~890 GB
+  ┌───────────┐    copy once     ┌─────────────┐   fast read    ┌──────┐
+  │  Lustre   │ ──────────────► │ Local NVMe  │ ─────────────► │ GPU  │
+  │  (shared) │   at job start   │ (per-node)  │  during train  │      │
+  └───────────┘                  └─────────────┘                └──────┘
 
-  Single H100 GPU memory:     80 GB
-  Minimum GPUs needed:        890 / 80 ≈ 12 GPUs (with ZeRO-3)
-
-  But for good performance (not just fitting in memory):
-  Recommended:                64 GPUs (8 servers × 8 GPUs)
-  Reason: More GPUs = larger batch size = better training stability
-          + enough room for activations and overhead
-
-Cluster sizing examples:
-
-┌──────────────┬─────────┬──────────┬──────────────────────┐
-│ Model Size   │ Min GPUs│ Servers  │ Notes                │
-├──────────────┼─────────┼──────────┼──────────────────────┤
-│ 7B (LLaMA 3) │ 1-8     │ 1        │ Fits on 1 server     │
-│ 13B          │ 2-8     │ 1        │ Fits on 1 server     │
-│ 70B          │ 16-64   │ 2-8      │ Needs multi-node     │
-│ 175B (GPT-3) │ 64-256  │ 8-32     │ Needs large cluster  │
-│ 400B+        │ 256+    │ 32+      │ Massive cluster      │
-└──────────────┴─────────┴──────────┴──────────────────────┘
+Why? Reading from shared storage for every batch is slow.
+Copy the dataset to fast local NVMe once, then read from there.
+This is called "data staging" or "caching."
 ```
 
 ---
 
-## Step 2: Install and Configure the Software Stack
+## Part 2: NCCL — The Communication Engine
 
-### 2.1 The Full Software Stack (Bottom to Top)
+### 2.1 What Does NCCL Actually Do?
 
-Think of the software as layers, like a building. Each layer depends on the one below it:
+NCCL (NVIDIA Collective Communications Library, pronounced "nickel") is the software library that **moves data between GPUs**. Every time GPUs need to share information during training, NCCL handles it.
+
+**Analogy:** If GPUs are workers in different offices, and NVLink/InfiniBand are the hallways between offices, then NCCL is the **mail delivery system**. It figures out the fastest route, the best schedule, and the most efficient way to deliver packages (data) between workers (GPUs).
+
+**What happens without NCCL?** You would have to write your own code to:
+1. Figure out the GPU topology (which GPUs are connected by NVLink vs. InfiniBand)
+2. Choose the best algorithm (ring, tree, etc.)
+3. Break data into chunks and send them in the right order
+4. Handle errors and retries
+5. Overlap communication with computation
+
+This is incredibly complex. NCCL does it all automatically.
+
+### 2.2 When Does NCCL Run During LLM Training?
+
+Let's walk through **one training step** and see every point where NCCL is needed:
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Layer 7: User's Training Code                   │  ← Your train.py
-│  (PyTorch, DeepSpeed, Megatron-LM)              │
-├─────────────────────────────────────────────────┤
-│  Layer 6: ML Frameworks & Libraries              │  ← PyTorch, vLLM, etc.
-│  (torch.distributed, Flash Attention)            │
-├─────────────────────────────────────────────────┤
-│  Layer 5: Communication Library                  │  ← NCCL (GPU-to-GPU comms)
-│  (NCCL for GPUs, Gloo for CPUs)                 │
-├─────────────────────────────────────────────────┤
-│  Layer 4: Kubernetes + GPU Operator              │  ← Job scheduling
-│  (scheduler, device plugin, monitoring)          │
-├─────────────────────────────────────────────────┤
-│  Layer 3: Container Runtime                      │  ← Docker / containerd
-│  (NVIDIA Container Toolkit)                     │
-├─────────────────────────────────────────────────┤
-│  Layer 2: GPU Drivers + Libraries                │  ← CUDA, cuDNN, cuBLAS
-│  (NVIDIA Driver 535+, CUDA 12.x)               │
-├─────────────────────────────────────────────────┤
-│  Layer 1: Operating System                       │  ← Ubuntu 22.04 LTS
-│  (Linux kernel with GPU and IB support)          │
-├─────────────────────────────────────────────────┤
-│  Layer 0: Hardware                               │  ← GPUs, NVLink, InfiniBand
-│  (H100 GPUs, NVSwitch, ConnectX-7, IB Switches) │
-└─────────────────────────────────────────────────┘
+ONE TRAINING STEP (what happens when the model learns from one batch of data):
+
+Step 1: DATA LOADING (CPU)
+  CPU reads a batch of text from storage
+  CPU tokenizes text into numbers
+  CPU sends tokens to GPU memory
+  → NCCL not needed (this is CPU → GPU, handled by CUDA)
+
+Step 2: FORWARD PASS (GPU compute + NCCL)
+  The model processes the input tokens through all its layers.
+
+  For each transformer layer:
+    a) Each GPU computes its portion of the attention layer
+       → Local GPU compute, no communication needed
+
+    b) GPUs must combine their partial attention results
+       → NCCL All-Reduce over NVLink (intra-node, ~0.1 ms)
+
+    c) Each GPU computes its portion of the MLP (feed-forward) layer
+       → Local GPU compute, no communication needed
+
+    d) GPUs must combine their partial MLP results
+       → NCCL All-Reduce over NVLink (intra-node, ~0.1 ms)
+
+  Repeat for all 80 layers (for a 70B model)
+
+  At the end: the model produces predicted next tokens
+  We compare predictions to actual tokens → loss value
+
+Step 3: BACKWARD PASS (GPU compute + NCCL)
+  Same as forward, but in reverse — computing gradients.
+
+  For each transformer layer (in reverse order):
+    a) Compute local gradients
+       → Local GPU compute
+
+    b) Synchronize gradients across ALL GPUs (not just within a server)
+       → NCCL All-Reduce over NVLink (within server)
+       → NCCL All-Reduce over InfiniBand (across servers)
+
+       This is the BIGGEST communication step.
+       For a 70B model: ~140 GB of gradient data must be
+       synchronized across all 64 GPUs.
+
+Step 4: OPTIMIZER UPDATE (GPU compute)
+  Each GPU updates its portion of the model weights
+  → Local GPU compute, no communication needed
+
+Step 5: REPEAT from Step 1 with the next batch
 ```
 
-### 2.2 Layer 1: Operating System Setup
+**Summary of NCCL usage in one step:**
 
-Every server needs the same base operating system. Ubuntu 22.04 LTS is the standard choice.
+| Phase | NCCL Operation | Network Used | Data Volume |
+|-------|---------------|-------------|-------------|
+| Forward: tensor parallel | All-Reduce (per layer) | NVLink | ~small (activations) |
+| Forward: pipeline parallel | Send/Recv (between stages) | InfiniBand | ~medium (activations) |
+| Backward: gradient sync | All-Reduce (global) | NVLink + InfiniBand | ~large (all gradients) |
+| ZeRO: parameter gather | All-Gather | NVLink + InfiniBand | ~large (model weights) |
+
+### 2.3 How NCCL Chooses the Best Path
+
+NCCL is smart — it automatically detects the network topology and picks the fastest algorithm. Here's what happens when NCCL initializes:
+
+```
+NCCL Initialization (happens once when training starts):
+
+1. DISCOVER TOPOLOGY
+   NCCL scans the system and builds a map:
+
+   "I see 64 GPUs total:
+    - GPUs 0-7 are on Node 0, connected by NVSwitch (900 GB/s)
+    - GPUs 8-15 are on Node 1, connected by NVSwitch (900 GB/s)
+    - ...
+    - Nodes are connected by InfiniBand (50 GB/s per link, 8 links per node)
+    - Each GPU has a dedicated InfiniBand NIC"
+
+2. CHOOSE ALGORITHM per operation size:
+
+   Small messages (< 256 KB):
+   → Use TREE algorithm (low latency, fewer steps)
+   → Like sending a text message — fast for small data
+
+   Large messages (> 256 KB):
+   → Use RING algorithm (high bandwidth, uses all links)
+   → Like shipping a container — efficient for bulk data
+
+   If SHARP-capable switches are available:
+   → Use CollNet (reduction happens IN the network switch)
+   → Like sorting mail at the post office instead of at each house
+
+3. CHOOSE PROTOCOL:
+
+   Tiny messages: LL (Low Latency) protocol
+   → Prioritizes speed over throughput
+
+   Medium messages: LL128 protocol
+   → Balance of latency and throughput
+
+   Large messages: Simple protocol
+   → Maximum throughput, higher latency OK
+
+4. BUILD COMMUNICATION CHANNELS
+   NCCL creates multiple parallel "channels" to use all
+   available NVLink and InfiniBand links simultaneously.
+
+   With 8 InfiniBand NICs per node:
+   → NCCL creates 8 channels, each using a different NIC
+   → All 8 transfer data simultaneously = 8× more bandwidth
+```
+
+### 2.4 NCCL Configuration for Our Cluster
+
+These environment variables tell NCCL how to behave on our cluster:
 
 ```bash
-# On EVERY server in the cluster:
+# ─── Network Configuration ───
+# Tell NCCL to use InfiniBand (not Ethernet)
+export NCCL_IB_DISABLE=0              # 0 = InfiniBand enabled (yes, use it!)
 
-# 1. Install Ubuntu 22.04 LTS Server (minimal install)
-#    Use a provisioning tool like PXE boot, MAAS, or Foreman
-#    to install the same image on all servers automatically.
+# Tell NCCL which network interface to use for control messages
+export NCCL_SOCKET_IFNAME=ib0         # Use the InfiniBand interface
 
-# 2. Configure InfiniBand drivers (MLNX_OFED)
-#    This is the driver package for ConnectX InfiniBand cards.
-#    Download from NVIDIA (formerly Mellanox) website.
-wget https://content.mellanox.com/ofed/MLNX_OFED-23.10/MLNX_OFED_LINUX-23.10-x.x.x-ubuntu22.04-x86_64.tgz
-tar xzf MLNX_OFED_LINUX-*.tgz
-cd MLNX_OFED_LINUX-*
-./mlnxofedinstall --add-kernel-support
+# Tell NCCL which InfiniBand cards to use
+export NCCL_IB_HCA=mlx5               # Mellanox/NVIDIA ConnectX cards
 
-# 3. Verify InfiniBand is working
-ibstat          # Shows status of each IB port (should say "Active")
-ibping          # Ping another server over InfiniBand
-ib_write_bw     # Benchmark InfiniBand bandwidth between two servers
+# ─── GPUDirect RDMA ───
+# Enable direct GPU-to-network transfers (bypassing CPU)
+export NCCL_NET_GDR_LEVEL=5           # Maximum GPUDirect RDMA level
+export NCCL_IB_GID_INDEX=3            # RoCE GID index for IB
 
-# Expected output of ibstat:
-#   Port 1:
-#     State: Active       ← Good! Port is connected
-#     Physical state: LinkUp
-#     Rate: 400 Gb/s      ← NDR InfiniBand speed
+# ─── Performance Tuning ───
+# Allow NCCL to use all InfiniBand NICs
+export NCCL_CROSS_NIC=1               # GPUs can use any NIC, not just their closest one
+
+# Buffer size for communication (larger = more throughput for big messages)
+export NCCL_BUFFSIZE=16777216          # 16 MB buffer
+
+# Number of communication channels (more = higher bandwidth)
+# Default is auto-detected, but you can force it:
+# export NCCL_MIN_NCHANNELS=8
+# export NCCL_MAX_NCHANNELS=16
+
+# ─── Debugging (use during setup, disable in production) ───
+export NCCL_DEBUG=INFO                 # Print what NCCL is doing
+export NCCL_DEBUG_SUBSYS=ALL           # Print everything
+# Change to WARN in production to reduce log noise
 ```
 
-### 2.3 Layer 2: GPU Drivers and CUDA
+### 2.5 Verifying NCCL Performance
+
+Before running any LLM training, **always test NCCL** to make sure the network is working at full speed. This is like test-driving a car before a road trip.
 
 ```bash
-# On EVERY server:
+# Build the NCCL test suite
+git clone https://github.com/NVIDIA/nccl-tests.git
+cd nccl-tests
+make MPI=1 CUDA_HOME=/usr/local/cuda NCCL_HOME=/usr/local/nccl
 
-# 1. Install NVIDIA GPU driver
-#    The driver lets the operating system talk to the GPUs.
-sudo apt-get install nvidia-driver-535
+# ─── Test 1: Intra-node (8 GPUs within one server) ───
+# This tests NVLink performance
+mpirun -np 8 ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 1
 
-# 2. Verify GPUs are detected
-nvidia-smi
-# Should show all 8 GPUs with their temperatures, memory, etc.
-# Example output:
-# +--------+------+------+------+
-# | GPU  0 | H100 | 80GB | 32°C |
-# | GPU  1 | H100 | 80GB | 31°C |
-# | ...    | ...  | ...  | ...  |
-# | GPU  7 | H100 | 80GB | 33°C |
-# +--------+------+------+------+
+# Expected output (H100 NVSwitch):
+#   size         busbw (GB/s)
+#   1 MB         ~40 GB/s
+#   1 GB         ~400 GB/s      ← Should be close to 450 GB/s theoretical
+#   4 GB         ~430 GB/s
 
-# 3. Install CUDA Toolkit
-#    CUDA is the programming platform for NVIDIA GPUs.
-#    It includes the compiler, libraries, and tools.
-wget https://developer.download.nvidia.com/compute/cuda/12.2.0/local_installers/cuda_12.2.0_535.54.03_linux.run
-sudo sh cuda_12.2.0_535.54.03_linux.run
+# If you see much less than 400 GB/s → NVLink problem!
 
-# 4. Install cuDNN (deep learning library) and NCCL
-sudo apt-get install libcudnn8 libnccl2 libnccl-dev
+# ─── Test 2: Inter-node (64 GPUs across 8 servers) ───
+# This tests InfiniBand performance
+mpirun -np 64 --hostfile hosts.txt \
+    -x NCCL_IB_DISABLE=0 \
+    -x NCCL_DEBUG=INFO \
+    ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 1
 
-# 5. Verify NVLink is working
-nvidia-smi nvlink -s
-# Shows NVLink status for each GPU pair
-# All links should show "Active"
+# Expected output (8× 400 Gb/s InfiniBand per node):
+#   size         busbw (GB/s)
+#   1 MB         ~10 GB/s
+#   1 GB         ~150 GB/s
+#   4 GB         ~180 GB/s     ← Should approach 200 GB/s (8 × 50 GB/s × efficiency)
 
-# 6. Verify GPU-to-GPU bandwidth
-# Run NVIDIA's bandwidth test
-/usr/local/cuda/samples/1_Utilities/p2pBandwidthLatencyTest/p2pBandwidthLatencyTest
-# Should show ~800-900 GB/s between GPU pairs (NVSwitch)
+# If you see much less than 150 GB/s → InfiniBand problem!
+# Common issues: wrong NIC selected, GPUDirect RDMA not working,
+# cable problem, switch misconfiguration
 ```
 
-### 2.4 Layer 3: Container Runtime
+**How to read the results:**
 
-Kubernetes runs everything in containers. We need Docker/containerd plus NVIDIA's container toolkit (so containers can access GPUs).
+```
+# nccl-tests output columns explained:
+#
+#  size     = message size being tested
+#  count    = number of elements
+#  type     = data type (float)
+#  redop    = reduction operation (sum)
+#  time     = how long the operation took (microseconds)
+#  algbw    = algorithm bandwidth (raw data / time)
+#  busbw    = bus bandwidth (what you should compare against hardware specs)
+#
+# busbw is the KEY metric. It accounts for the algorithm overhead
+# and tells you how much of the hardware bandwidth you're actually using.
+#
+# Good busbw / theoretical max:
+#   > 80% = excellent
+#   > 60% = acceptable
+#   < 50% = something is wrong, investigate
+```
+
+---
+
+## Part 3: Kubernetes — The Scheduler
+
+### 3.1 Why Kubernetes for GPU Clusters?
+
+Kubernetes manages our cluster. It decides:
+- Which server runs which training job
+- How many GPUs each job gets
+- What happens when a job fails (restart it)
+- How to scale inference up/down based on demand
+
+**Why not SLURM?** Both work. We chose Kubernetes because:
+- We want **both training AND inference** on the same cluster
+- We want **autoscaling** for inference (add/remove copies based on traffic)
+- We want **containerized workloads** (reproducible environments)
+- We want **self-healing** (if a pod crashes, K8s restarts it automatically)
+- Our team is familiar with cloud-native tooling
+
+**Trade-off:** Kubernetes adds slightly more network overhead than bare-metal SLURM, and multi-node GPU training requires additional operators (Kubeflow, Volcano). For maximum training performance, some organizations use SLURM for training and Kubernetes for inference.
+
+### 3.2 Setting Up Kubernetes for GPUs
+
+Here is the step-by-step process to configure Kubernetes on our GPU cluster:
+
+**Step 1: Install Kubernetes on all nodes**
 
 ```bash
-# On EVERY server:
+# On every server node, install kubeadm, kubelet, and kubectl
+# (the three core Kubernetes components)
 
-# 1. Install containerd (Kubernetes-preferred container runtime)
-sudo apt-get install containerd
+# One node becomes the "control plane" (the brain)
+# The other 7 become "worker nodes" (where GPUs jobs run)
 
-# 2. Install NVIDIA Container Toolkit
-#    This is the bridge that lets containers see and use GPUs.
-#    Without it, a container is "blind" to GPUs.
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/libnvidia-container/gpgkey | sudo apt-key add -
-curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
-    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update
-sudo apt-get install nvidia-container-toolkit
+# Initialize the control plane (run on the master node)
+kubeadm init --pod-network-cidr=10.244.0.0/16
 
-# 3. Configure containerd to use NVIDIA runtime
-sudo nvidia-ctk runtime configure --runtime=containerd
-sudo systemctl restart containerd
-
-# 4. Test: Run a container that uses GPUs
-sudo ctr run --rm --gpus 0 nvcr.io/nvidia/cuda:12.2.0-base-ubuntu22.04 test nvidia-smi
-# Should show GPU info inside the container — proof that containers can access GPUs!
+# Join worker nodes to the cluster (run on each worker)
+kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash <hash>
 ```
 
-### 2.5 Layer 4: Kubernetes Installation
+**Step 2: Install the NVIDIA GPU Operator**
 
-Now we install Kubernetes across all servers. One server becomes the "control plane" (the brain), and all others become "worker nodes" (the muscle).
-
-```
-Cluster layout:
-
-  Server 0: Kubernetes Control Plane + Worker (or dedicated control plane)
-  Server 1-N: Worker nodes (run GPU jobs)
-
-  In small clusters (< 16 nodes): Control plane shares a server with workers
-  In large clusters (16+ nodes): Dedicate 3 servers to control plane (for redundancy)
-```
+The GPU Operator automatically installs everything Kubernetes needs to use GPUs:
 
 ```bash
-# ─────────────────────────────────────────────
-# On ALL servers: Install Kubernetes components
-# ─────────────────────────────────────────────
-
-# 1. Install kubeadm, kubelet, kubectl
-sudo apt-get install -y kubelet kubeadm kubectl
-sudo apt-mark hold kubelet kubeadm kubectl  # Prevent auto-updates
-
-# ─────────────────────────────────────────────
-# On the CONTROL PLANE server (Server 0):
-# ─────────────────────────────────────────────
-
-# 2. Initialize the Kubernetes cluster
-#    This creates the control plane (API server, scheduler, etcd)
-sudo kubeadm init \
-    --pod-network-cidr=10.244.0.0/16 \
-    --control-plane-endpoint=server-0.example.com
-
-# 3. Set up kubectl access
-mkdir -p $HOME/.kube
-sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
-
-# 4. Install a network plugin (pods need networking)
-#    Flannel is simple and works well
-kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-
-# 5. Get the join command (you'll need this for worker nodes)
-kubeadm token create --print-join-command
-# Output: kubeadm join server-0:6443 --token abc123 --discovery-token-ca-cert-hash sha256:xyz789
-
-# ─────────────────────────────────────────────
-# On EACH WORKER server (Server 1, 2, 3, ...):
-# ─────────────────────────────────────────────
-
-# 6. Join the cluster (paste the command from step 5)
-sudo kubeadm join server-0:6443 --token abc123 --discovery-token-ca-cert-hash sha256:xyz789
-
-# ─────────────────────────────────────────────
-# Back on CONTROL PLANE: Verify all nodes joined
-# ─────────────────────────────────────────────
-
-kubectl get nodes
-# Output:
-# NAME       STATUS   ROLES           AGE   VERSION
-# server-0   Ready    control-plane   10m   v1.28.0
-# server-1   Ready    <none>          5m    v1.28.0
-# server-2   Ready    <none>          5m    v1.28.0
-# server-3   Ready    <none>          5m    v1.28.0
-# ...
-```
-
-### 2.6 Layer 4 (continued): NVIDIA GPU Operator
-
-The GPU Operator automatically sets up everything GPUs need in Kubernetes. Instead of manually installing drivers and plugins on each node, the operator does it all:
-
-```bash
-# On the control plane server:
-
-# 1. Install Helm (Kubernetes package manager)
-curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-# 2. Add NVIDIA Helm repository
+# Add NVIDIA Helm repository
 helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
 helm repo update
 
-# 3. Install the GPU Operator
-#    This single command installs:
-#    - GPU device plugin (tells K8s about GPUs)
-#    - DCGM exporter (GPU monitoring → Prometheus)
-#    - GPU Feature Discovery (labels nodes with GPU type)
-#    - MIG Manager (if using Multi-Instance GPU)
+# Install the GPU Operator
+# This single command installs: GPU drivers, container toolkit,
+# device plugin, DCGM monitoring, and more
 helm install gpu-operator nvidia/gpu-operator \
     --namespace gpu-operator \
     --create-namespace \
     --set driver.enabled=true \
     --set toolkit.enabled=true \
+    --set devicePlugin.enabled=true \
     --set dcgmExporter.enabled=true \
-    --set migManager.enabled=false
-
-# 4. Wait for all GPU Operator pods to be ready
-kubectl -n gpu-operator get pods -w
-# Wait until all pods show "Running" or "Completed"
-
-# 5. Verify GPUs are visible to Kubernetes
-kubectl describe node server-1 | grep nvidia.com/gpu
-# Output:
-#   nvidia.com/gpu:  8        ← Kubernetes sees 8 GPUs on this node!
-#   nvidia.com/gpu:  8        ← 8 are allocatable
+    --set migManager.enabled=false \
+    --set gds.enabled=true
 ```
 
-**What just happened?** The GPU Operator automatically:
-1. Detected all NVIDIA GPUs on every node
-2. Installed device plugins so Kubernetes knows "this node has 8 GPUs"
-3. Started monitoring agents that track GPU temperature, utilization, memory
-4. Labeled nodes with GPU type (e.g., `nvidia.com/gpu.product=NVIDIA-H100-SXM`)
-5. Now when a pod requests `nvidia.com/gpu: 4`, Kubernetes knows which nodes have free GPUs
+What the GPU Operator installs on every node:
 
-### 2.7 Configure InfiniBand for Kubernetes
+```
+┌─────────────────────────────────────────────────┐
+│            GPU Operator Components                │
+│                                                   │
+│  ┌─────────────────────────────────────────────┐ │
+│  │ NVIDIA Driver (kernel module)                │ │
+│  │ → Lets the OS talk to the GPU hardware       │ │
+│  └─────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────┐ │
+│  │ NVIDIA Container Toolkit                     │ │
+│  │ → Lets containers (Docker/containerd) see    │ │
+│  │   and use GPUs inside the container          │ │
+│  └─────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────┐ │
+│  │ NVIDIA Device Plugin                         │ │
+│  │ → Tells Kubernetes "this node has 8 GPUs"    │ │
+│  │ → Allocates specific GPUs to pods            │ │
+│  └─────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────┐ │
+│  │ DCGM Exporter                                │ │
+│  │ → Monitors GPU health (temp, power, errors)  │ │
+│  │ → Exports metrics to Prometheus/Grafana       │ │
+│  └─────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────┐ │
+│  │ GDS (GPUDirect Storage)                      │ │
+│  │ → Allows direct NVMe-to-GPU data transfer    │ │
+│  └─────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────┘
+```
 
-By default, Kubernetes pods use a virtual overlay network (slow). For LLM training, we need pods to use the **real InfiniBand network** directly. There are two approaches:
+**Step 3: Configure InfiniBand networking for Kubernetes**
 
-**Approach A: Host Networking (Simpler)**
+By default, Kubernetes uses overlay networks (like Flannel or Calico) which add overhead. For GPU training, we need pods to use InfiniBand directly. We use **Multus** — a plugin that lets pods have multiple network interfaces:
 
-Pods share the host's network stack directly. No overlay network overhead.
+```bash
+# Install Multus (allows pods to use InfiniBand)
+kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset.yml
+
+# Install RDMA shared device plugin (exposes InfiniBand to pods)
+kubectl apply -f rdma-shared-device-plugin.yaml
+```
+
+Then create a network attachment definition for InfiniBand:
 
 ```yaml
-# In your training pod/job spec, add:
+# ib-network.yaml
+# This tells Kubernetes: "There is an InfiniBand network available
+# that pods can attach to"
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: ib-sriov-network
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: rdma/rdma_shared_device_a
 spec:
-  hostNetwork: true      # Pod uses the host's network directly
-  dnsPolicy: ClusterFirstWithHostNet
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "host-device",
+      "device": "ib0",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.1.0/24"
+      }
+    }
 ```
 
-Pros: Simple, full InfiniBand performance, zero overhead
-Cons: Pods share the host network (port conflicts possible), less isolation
+**Step 4: Install Volcano for batch scheduling**
 
-**Approach B: RDMA Device Plugin (More Kubernetes-native)**
-
-Use the `k8s-rdma-shared-dev-plugin` to expose InfiniBand devices to pods as resources:
+Standard Kubernetes scheduler doesn't understand "I need all 64 GPUs to start at the same time." Volcano adds gang scheduling:
 
 ```bash
-# Install RDMA shared device plugin
-kubectl apply -f https://raw.githubusercontent.com/Mellanox/k8s-rdma-shared-dev-plugin/master/deployment/rdma-shared-dev-plugin-ds.yaml
+# Install Volcano scheduler
+kubectl apply -f https://raw.githubusercontent.com/volcano-sh/volcano/master/installer/volcano-development.yaml
 ```
 
-```yaml
-# Then in your pod spec, request RDMA devices:
-resources:
-  limits:
-    nvidia.com/gpu: 8
-    rdma/rdma_shared_device_a: 1    # Request InfiniBand access
-```
+**Step 5: Install Kubeflow Training Operator**
 
-**Recommended: Use host networking** for training jobs (maximum performance). Use overlay networking for inference/serving (better isolation).
-
-### 2.8 Layer 5: NCCL Configuration
-
-NCCL doesn't need a separate installation — it comes with PyTorch and CUDA. But it needs to be **configured correctly** to use our InfiniBand network and NVLink topology.
-
-**How NCCL decides how to send data:**
-
-```
-When GPU 0 on Server A needs to send data to GPU 3 on Server B,
-NCCL automatically decides the best path:
-
-Step 1: NCCL detects the hardware topology
-  "GPU 0 is connected to NIC 0 via PCIe"
-  "NIC 0 is an InfiniBand ConnectX-7"
-  "GPU 3 on Server B is connected to NIC 3"
-
-Step 2: NCCL picks the fastest transport
-  Same GPU?      → Memory copy (instant)
-  Same server?   → NVLink (900 GB/s)
-  Different server? → InfiniBand via GPUDirect RDMA (50 GB/s per port)
-
-Step 3: NCCL picks the best algorithm
-  Small message (<256 KB)?  → Tree algorithm (low latency)
-  Large message (>256 KB)?  → Ring algorithm (high bandwidth)
-  InfiniBand with SHARP?    → CollNet (in-switch reduction)
-```
-
-**Critical NCCL environment variables for our cluster:**
-
-```bash
-# These go in your training container's environment or job spec
-
-# ── Network Configuration ──
-NCCL_IB_DISABLE=0                  # Enable InfiniBand (DO NOT disable it!)
-NCCL_SOCKET_IFNAME=ib0             # Use InfiniBand interface, not Ethernet
-NCCL_IB_HCA=mlx5                   # Use Mellanox ConnectX cards
-NCCL_IB_GID_INDEX=3                # GID index for RoCE (if using RoCE instead of IB)
-NCCL_NET_GDR_LEVEL=5               # Enable GPUDirect RDMA (GPU talks directly to NIC)
-
-# ── Performance Tuning ──
-NCCL_BUFFSIZE=16777216             # 16 MB communication buffer (larger = better for big messages)
-NCCL_NTHREADS=512                  # Threads per NCCL kernel
-NCCL_CROSS_NIC=1                   # Allow using multiple NICs per GPU (if topology allows)
-
-# ── Debugging (turn on during setup, off during production) ──
-NCCL_DEBUG=INFO                    # Print what NCCL is doing (topology, algorithm choices)
-NCCL_DEBUG_SUBSYS=ALL              # Full detail
-
-# Example NCCL_DEBUG output when starting training:
-#   NCCL INFO Using network IB                    ← Good! Using InfiniBand
-#   NCCL INFO Ring 00: 0[0]->1[1] via P2P/NVLink  ← Good! Using NVLink within server
-#   NCCL INFO Ring 00: 7[7]->8[0] via NET/IB      ← Good! Using InfiniBand between servers
-#   NCCL INFO Algorithm Ring protocol Simple       ← Ring algorithm for large data
-```
-
-**Verify NCCL performance with nccl-tests:**
-
-```bash
-# Build nccl-tests inside a container or on bare metal
-git clone https://github.com/NVIDIA/nccl-tests.git
-cd nccl-tests
-make MPI=1 CUDA_HOME=/usr/local/cuda NCCL_HOME=/usr/local/nccl
-
-# Test 1: Intra-node all-reduce (8 GPUs on 1 server)
-# This tests NVLink performance
-mpirun -np 8 ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 1
-
-# Expected results (H100 with NVSwitch):
-#   Message Size    Bus Bandwidth
-#   1 MB            ~200 GB/s
-#   128 MB          ~400 GB/s
-#   4 GB            ~450 GB/s     ← Should be close to NVLink theoretical max
-
-# Test 2: Inter-node all-reduce (16 GPUs across 2 servers)
-# This tests InfiniBand performance
-mpirun -np 16 --hostfile hosts.txt \
-    -x NCCL_IB_DISABLE=0 \
-    -x NCCL_SOCKET_IFNAME=ib0 \
-    ./build/all_reduce_perf -b 1M -e 4G -f 2 -g 1
-
-# Expected results (8× NDR 400Gb InfiniBand per server):
-#   Message Size    Bus Bandwidth
-#   1 MB            ~50 GB/s
-#   128 MB          ~150 GB/s
-#   4 GB            ~200 GB/s     ← Should approach aggregate IB bandwidth
-
-# If numbers are much lower than expected:
-#   - Check NCCL_DEBUG output for "Using network TCP" (bad! Should be IB)
-#   - Check GPUDirect RDMA is enabled (NCCL_NET_GDR_LEVEL=5)
-#   - Check InfiniBand link status with ibstat
-#   - Check for PCIe topology issues with nvidia-smi topo -m
-```
-
-### 2.9 Layer 6-7: ML Frameworks
-
-```bash
-# Inside your training container (Dockerfile):
-
-# Start from NVIDIA's PyTorch container (has everything pre-installed)
-FROM nvcr.io/nvidia/pytorch:24.01-py3
-
-# This container already includes:
-# - PyTorch with CUDA support
-# - NCCL (optimized for this CUDA version)
-# - cuDNN, cuBLAS
-# - NVIDIA Apex (mixed precision)
-# - Flash Attention
-
-# Install additional LLM training libraries
-pip install deepspeed                # Microsoft's distributed training library
-pip install transformers datasets    # Hugging Face model/data libraries
-pip install flash-attn               # Efficient attention implementation
-pip install wandb                    # Experiment tracking (optional)
-
-# For inference serving:
-pip install vllm                     # High-throughput LLM serving engine
-```
-
----
-
-## Step 3: Set Up Kubernetes for LLM Workloads
-
-### 3.1 Label Nodes by GPU Type
-
-Kubernetes needs to know what kind of GPUs each node has, so it can schedule jobs to the right place:
-
-```bash
-# The GPU Operator auto-labels nodes, but you can add custom labels too:
-kubectl label nodes server-1 gpu-type=h100
-kubectl label nodes server-1 infiniband=true
-kubectl label nodes server-1 nvlink=nvswitch
-
-# Verify labels
-kubectl get nodes --show-labels | grep gpu-type
-```
-
-### 3.2 Reserve GPU Nodes for GPU Workloads
-
-Don't let random non-GPU jobs waste your expensive GPU servers:
-
-```bash
-# Taint all GPU nodes: "Only GPU workloads allowed here"
-kubectl taint nodes server-1 nvidia.com/gpu=present:NoSchedule
-kubectl taint nodes server-2 nvidia.com/gpu=present:NoSchedule
-# ... repeat for all GPU nodes
-
-# Now only pods with this toleration can run on GPU nodes:
-# tolerations:
-# - key: "nvidia.com/gpu"
-#   operator: "Equal"
-#   value: "present"
-#   effect: "NoSchedule"
-```
-
-### 3.3 Install Kubeflow Training Operator
-
-This teaches Kubernetes how to run distributed training jobs:
+For distributed training (PyTorchJob, MPIJob):
 
 ```bash
 # Install Kubeflow Training Operator
 kubectl apply -k "github.com/kubeflow/training-operator/manifests/overlays/standalone"
-
-# Verify it's running
-kubectl -n kubeflow get pods
-# Should show training-operator-xxx pod in Running state
-
-# Now Kubernetes understands:
-# - PyTorchJob   (distributed PyTorch training)
-# - MPIJob       (MPI-based distributed training)
-# - TFJob        (TensorFlow training)
 ```
 
-### 3.4 Install Volcano Scheduler (for batch job queuing)
+**Step 6: Set up shared storage**
 
-Standard Kubernetes scheduler doesn't understand HPC-style batch queuing. Volcano adds:
-- Gang scheduling (all pods start together or none start)
-- Fair-share queues (multiple teams share resources fairly)
-- Priority preemption
-
-```bash
-# Install Volcano
-kubectl apply -f https://raw.githubusercontent.com/volcano-sh/volcano/master/installer/volcano-development.yaml
-
-# Create a GPU queue for training jobs
-kubectl apply -f - <<EOF
-apiVersion: scheduling.volcano.sh/v1beta1
-kind: Queue
+```yaml
+# Create a PersistentVolume for training data
+# This connects Kubernetes to our Lustre file system
+apiVersion: v1
+kind: PersistentVolume
 metadata:
-  name: gpu-training
+  name: training-data-pv
 spec:
-  weight: 1
-  reclaimable: true
-  capability:
-    nvidia.com/gpu: 64     # This queue can use up to 64 GPUs
-EOF
+  capacity:
+    storage: 100Ti          # 100 TB of training data
+  accessModes:
+    - ReadOnlyMany          # Many pods can read simultaneously
+  mountOptions:
+    - noatime               # Don't track access times (faster)
+  csi:
+    driver: lustre.csi.io
+    volumeHandle: training-data
+    volumeAttributes:
+      mgs: lustre-mgs.cluster.local@tcp
+      fs: training
+
+---
+# Claim the volume so pods can use it
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-data-pvc
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 100Ti
+  volumeName: training-data-pv
 ```
 
-### 3.5 Install Monitoring Stack
+### 3.3 Verifying the Kubernetes GPU Setup
 
-You need to see what's happening on your cluster — GPU utilization, temperatures, job status:
+After installation, verify everything works:
 
 ```bash
-# Install Prometheus + Grafana using Helm
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm install kube-prometheus prometheus-community/kube-prometheus-stack \
-    --namespace monitoring \
-    --create-namespace
+# Check that Kubernetes sees all GPUs
+kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,\
+GPUs:.status.capacity.nvidia\.com/gpu
 
-# The GPU Operator's DCGM exporter automatically exposes GPU metrics
-# Prometheus will scrape them and Grafana will display dashboards showing:
-# - Per-GPU utilization (SM activity, Tensor Core activity)
-# - GPU memory usage
-# - GPU temperature and power draw
-# - NVLink bandwidth
-# - InfiniBand throughput
-# - Training throughput (tokens/s — from your training code)
+# Expected output:
+# NAME       GPUs
+# node-00    8
+# node-01    8
+# node-02    8
+# node-03    8
+# node-04    8
+# node-05    8
+# node-06    8
+# node-07    8
+
+# Run a quick GPU test pod
+kubectl run gpu-test --image=nvidia/cuda:12.2.0-base-ubuntu22.04 \
+    --limits=nvidia.com/gpu=1 \
+    --command -- nvidia-smi
+
+# Check the output
+kubectl logs gpu-test
+# Should show GPU info (name, memory, temperature, etc.)
 ```
 
 ---
 
-## Step 4: Run LLM Training on the Cluster
-
-Now everything is set up. Let's train an LLM!
+## Part 4: Running LLM Training
 
 ### 4.1 Distributed Training Job (PyTorchJob)
 
-This example trains LLaMA 70B across 4 servers (32 GPUs):
+Here is a complete example that trains LLaMA-70B across all 64 GPUs in our cluster:
 
 ```yaml
-# file: llama-70b-training.yaml
+# llama-70b-training.yaml
+#
+# This creates a distributed training job that:
+# - Uses all 8 servers (64 GPUs total)
+# - Uses Tensor Parallelism within each server (over NVLink)
+# - Uses Data Parallelism across servers (over InfiniBand)
+# - NCCL handles all GPU-to-GPU communication automatically
+
 apiVersion: kubeflow.org/v1
 kind: PyTorchJob
 metadata:
   name: llama-70b-pretrain
   namespace: training
 spec:
-  # Elastic training: can scale between 4 and 8 nodes
   elasticPolicy:
-    rdzvBackend: c10d
-    minReplicas: 4
-    maxReplicas: 8
+    rdzvBackend: c10d           # PyTorch's built-in rendezvous
+    minReplicas: 8              # Need at least 8 nodes
+    maxReplicas: 8              # Use exactly 8 nodes
   pytorchReplicaSpecs:
     Master:
       replicas: 1
       template:
         metadata:
-          labels:
-            app: llm-training
+          annotations:
+            # Attach InfiniBand network to this pod
+            k8s.v1.cni.cncf.io/networks: ib-sriov-network
         spec:
-          hostNetwork: true                    # Use InfiniBand directly
-          dnsPolicy: ClusterFirstWithHostNet
+          schedulerName: volcano    # Use Volcano for gang scheduling
+          # Make sure this runs on H100 nodes only
+          nodeSelector:
+            nvidia.com/gpu.product: NVIDIA-H100-SXM
           tolerations:
           - key: "nvidia.com/gpu"
-            operator: "Equal"
-            value: "present"
+            operator: "Exists"
             effect: "NoSchedule"
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                - matchExpressions:
-                  - key: nvidia.com/gpu.product
-                    operator: In
-                    values:
-                    - NVIDIA-H100-SXM           # Only H100 nodes
           containers:
           - name: trainer
-            image: my-registry/llm-trainer:v1
+            image: my-registry/llm-trainer:v2.0
             command:
             - torchrun
-            - --nproc_per_node=8                # 8 GPUs per server
-            - --nnodes=4                        # 4 servers total
+            - --nproc_per_node=8         # 8 GPUs per server
+            - --nnodes=8                 # 8 servers total
             - train.py
             - --model=meta-llama/Llama-3-70B
-            - --tensor-parallel-size=8          # Split layers across 8 GPUs (intra-node)
-            - --pipeline-parallel-size=2        # Split model into 2 pipeline stages
-            - --data-parallel-size=2            # 2 data-parallel replicas
-            - --micro-batch-size=2
-            - --global-batch-size=256
-            - --bf16                            # Use BF16 mixed precision
-            - --flash-attention                 # Use Flash Attention
-            - --activation-checkpointing        # Save memory by recomputing activations
+            - --tensor-parallel-size=8   # Split layers across 8 GPUs (NVLink)
+            - --data-parallel-size=8     # 8 copies of model across servers (IB)
+            - --batch-size-per-gpu=4     # 4 sequences per GPU
+            - --sequence-length=4096     # 4096 tokens per sequence
+            - --bf16                     # Use BF16 mixed precision
+            - --flash-attention          # Use Flash Attention (faster + less memory)
+            - --gradient-checkpointing   # Trade compute for memory
+            - --dataset=/data/pile       # Training data location
+            - --output=/checkpoints/llama-70b
             env:
-            # NCCL configuration for InfiniBand
+            # NCCL configuration
+            - name: NCCL_IB_DISABLE
+              value: "0"                 # Use InfiniBand
+            - name: NCCL_SOCKET_IFNAME
+              value: "ib0"               # InfiniBand interface
+            - name: NCCL_IB_HCA
+              value: "mlx5"              # NVIDIA InfiniBand cards
+            - name: NCCL_NET_GDR_LEVEL
+              value: "5"                 # Enable GPUDirect RDMA
+            - name: NCCL_DEBUG
+              value: "WARN"              # Minimal logging in production
+            resources:
+              limits:
+                nvidia.com/gpu: 8        # All 8 GPUs
+                memory: "512Gi"          # 512 GB RAM
+                cpu: "128"               # 128 CPU cores
+                rdma/rdma_shared_device_a: 1  # InfiniBand access
+              requests:
+                nvidia.com/gpu: 8
+                memory: "512Gi"
+                cpu: "128"
+            volumeMounts:
+            - name: training-data
+              mountPath: /data
+              readOnly: true
+            - name: checkpoints
+              mountPath: /checkpoints
+            - name: dev-shm
+              mountPath: /dev/shm        # Shared memory for NCCL
+          volumes:
+          - name: training-data
+            persistentVolumeClaim:
+              claimName: training-data-pvc
+          - name: checkpoints
+            persistentVolumeClaim:
+              claimName: checkpoints-pvc
+          - name: dev-shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: "128Gi"         # 128 GB shared memory for NCCL buffers
+    Worker:
+      replicas: 7                        # 7 workers + 1 master = 8 total
+      template:
+        # ... identical to Master template above ...
+        metadata:
+          annotations:
+            k8s.v1.cni.cncf.io/networks: ib-sriov-network
+        spec:
+          schedulerName: volcano
+          nodeSelector:
+            nvidia.com/gpu.product: NVIDIA-H100-SXM
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: trainer
+            image: my-registry/llm-trainer:v2.0
+            command:
+            - torchrun
+            - --nproc_per_node=8
+            - --nnodes=8
+            - train.py
+            - --model=meta-llama/Llama-3-70B
+            - --tensor-parallel-size=8
+            - --data-parallel-size=8
+            - --batch-size-per-gpu=4
+            - --sequence-length=4096
+            - --bf16
+            - --flash-attention
+            - --gradient-checkpointing
+            - --dataset=/data/pile
+            - --output=/checkpoints/llama-70b
+            env:
             - name: NCCL_IB_DISABLE
               value: "0"
             - name: NCCL_SOCKET_IFNAME
               value: "ib0"
-            - name: NCCL_NET_GDR_LEVEL
-              value: "5"
             - name: NCCL_IB_HCA
               value: "mlx5"
+            - name: NCCL_NET_GDR_LEVEL
+              value: "5"
             - name: NCCL_DEBUG
-              value: "WARN"                    # INFO for debugging, WARN for production
+              value: "WARN"
             resources:
               limits:
-                nvidia.com/gpu: 8              # All 8 GPUs on this node
-                memory: "1500Gi"               # Most of the node's RAM
-                cpu: "180"                     # Most of the node's CPUs
+                nvidia.com/gpu: 8
+                memory: "512Gi"
+                cpu: "128"
+                rdma/rdma_shared_device_a: 1
               requests:
                 nvidia.com/gpu: 8
-                memory: "1500Gi"
-                cpu: "180"
+                memory: "512Gi"
+                cpu: "128"
             volumeMounts:
             - name: training-data
               mountPath: /data
+              readOnly: true
             - name: checkpoints
               mountPath: /checkpoints
-            - name: shared-memory               # CRITICAL for PyTorch DataLoader
+            - name: dev-shm
               mountPath: /dev/shm
           volumes:
           - name: training-data
             persistentVolumeClaim:
-              claimName: training-data-pvc       # Lustre-backed PVC
+              claimName: training-data-pvc
           - name: checkpoints
             persistentVolumeClaim:
               claimName: checkpoints-pvc
-          - name: shared-memory
+          - name: dev-shm
             emptyDir:
               medium: Memory
-              sizeLimit: "256Gi"                # Large shared memory for data loading
-    Worker:
-      replicas: 3                               # 3 workers + 1 master = 4 nodes = 32 GPUs
-      template:
-        # ... same spec as Master
+              sizeLimit: "128Gi"
 ```
 
-**Understanding the parallelism configuration:**
+**What happens when you submit this job:**
 
 ```
-Our 32 GPUs are organized as:
+You run: kubectl apply -f llama-70b-training.yaml
 
-  4 servers × 8 GPUs = 32 GPUs total
+1. Kubernetes API Server receives the request
 
-  Tensor Parallel (TP) = 8:
-    All 8 GPUs within a server work on the SAME layer together.
-    Each GPU holds 1/8 of each layer's weight matrices.
-    They communicate via NVLink (900 GB/s) — super fast!
+2. Volcano scheduler checks:
+   "This job needs 8 nodes with 8 GPUs each.
+    Do I have 64 free GPUs? Let me check...
+    Yes! Nodes 0-7 all have 8 free H100 GPUs."
 
-  Pipeline Parallel (PP) = 2:
-    The 80 layers of LLaMA 70B are split into 2 stages:
-      Stage 0 (Layers 0-39):  Runs on Server 0 and Server 2
-      Stage 1 (Layers 40-79): Runs on Server 1 and Server 3
-    Activations flow between stages via InfiniBand.
+3. Volcano uses GANG SCHEDULING:
+   "I will start ALL 8 pods at the same time.
+    If only 6 nodes are free, I wait until all 8 are free.
+    (Because distributed training doesn't work with missing nodes)"
 
-  Data Parallel (DP) = 2:
-    We have 2 complete copies of the pipeline:
-      Copy A: Server 0 (stage 0) + Server 1 (stage 1)
-      Copy B: Server 2 (stage 0) + Server 3 (stage 1)
-    Each copy processes different training data.
-    Gradients are synchronized via all-reduce over InfiniBand.
+4. Kubelet on each node:
+   "I received a pod. Let me:
+    - Pull the container image
+    - Assign 8 GPUs to this container
+    - Mount the training data volume
+    - Set up InfiniBand networking
+    - Start the training command"
 
-  Verification: TP × PP × DP = 8 × 2 × 2 = 32 GPUs ✓
+5. torchrun on each node:
+   "I'm starting 8 training processes (one per GPU).
+    I need to find the master node to coordinate...
+    Found master at node-00:29500. Connecting..."
 
-  Visual layout:
+6. NCCL initializes:
+   "I see 64 GPUs across 8 nodes.
+    Intra-node: NVSwitch detected, 900 GB/s available
+    Inter-node: InfiniBand ConnectX-7, 8 × 50 GB/s = 400 GB/s
+    GPUDirect RDMA: enabled
+    Using Ring algorithm for large all-reduces
+    Using Tree algorithm for small broadcasts
+    Creating 8 communication channels per node"
 
-  ┌─ Data Parallel Group A ─────────────────────┐
-  │                                              │
-  │  Server 0 (Pipeline Stage 0)                 │
-  │  [GPU0│GPU1│GPU2│GPU3│GPU4│GPU5│GPU6│GPU7]   │
-  │   ↑────── Tensor Parallel (NVLink) ──────↑   │
-  │              │ activations (InfiniBand)       │
-  │              ▼                               │
-  │  Server 1 (Pipeline Stage 1)                 │
-  │  [GPU0│GPU1│GPU2│GPU3│GPU4│GPU5│GPU6│GPU7]   │
-  │                                              │
-  └──────────────────┬───────────────────────────┘
-                     │ gradient sync (InfiniBand all-reduce)
-  ┌──────────────────┴───────────────────────────┐
-  │                                              │
-  │  Server 2 (Pipeline Stage 0)                 │
-  │  [GPU0│GPU1│GPU2│GPU3│GPU4│GPU5│GPU6│GPU7]   │
-  │              │ activations (InfiniBand)       │
-  │              ▼                               │
-  │  Server 3 (Pipeline Stage 1)                 │
-  │  [GPU0│GPU1│GPU2│GPU3│GPU4│GPU5│GPU6│GPU7]   │
-  │                                              │
-  └─ Data Parallel Group B ─────────────────────┘
+7. Training begins:
+   - Each GPU processes 4 sequences of 4096 tokens per step
+   - Global batch = 4 × 64 GPUs = 256 sequences per step
+   - NCCL synchronizes gradients after each backward pass
+   - Model checkpoint saved every N steps to /checkpoints
 ```
 
-**Launch the training:**
+### 4.2 Monitoring Training
 
 ```bash
-# Submit the training job
-kubectl apply -f llama-70b-training.yaml
+# Watch pod status
+kubectl get pods -n training -w
 
-# Watch the pods come up
-kubectl -n training get pods -w
+# Expected output:
 # NAME                          READY   STATUS    RESTARTS   AGE
-# llama-70b-pretrain-master-0   1/1     Running   0          30s
-# llama-70b-pretrain-worker-0   1/1     Running   0          28s
-# llama-70b-pretrain-worker-1   1/1     Running   0          28s
-# llama-70b-pretrain-worker-2   1/1     Running   0          27s
+# llama-70b-pretrain-master-0   1/1     Running   0          2m
+# llama-70b-pretrain-worker-0   1/1     Running   0          2m
+# llama-70b-pretrain-worker-1   1/1     Running   0          2m
+# llama-70b-pretrain-worker-2   1/1     Running   0          2m
+# llama-70b-pretrain-worker-3   1/1     Running   0          2m
+# llama-70b-pretrain-worker-4   1/1     Running   0          2m
+# llama-70b-pretrain-worker-5   1/1     Running   0          2m
+# llama-70b-pretrain-worker-6   1/1     Running   0          2m
 
-# Check training logs
-kubectl -n training logs llama-70b-pretrain-master-0 -f
-# Output:
-# Step 1: loss=11.234, tokens/s=50000, MFU=42%
-# Step 2: loss=10.891, tokens/s=52000, MFU=44%
-# Step 3: loss=10.567, tokens/s=53000, MFU=45%
-# ... (loss goes down, throughput goes up as training warms up)
+# View training logs (loss, throughput, etc.)
+kubectl logs -n training llama-70b-pretrain-master-0 -f
 
-# Check GPU utilization on a specific node
+# Expected log output:
+# Step 100 | Loss: 8.42 | LR: 1.0e-04 | Tokens/s: 380,000 | MFU: 52%
+# Step 200 | Loss: 7.15 | LR: 2.0e-04 | Tokens/s: 395,000 | MFU: 54%
+# Step 300 | Loss: 6.33 | LR: 3.0e-04 | Tokens/s: 398,000 | MFU: 55%
+
+# Check GPU utilization across all nodes
 kubectl exec -n training llama-70b-pretrain-master-0 -- nvidia-smi
 ```
 
 ---
 
-## Step 5: Run LLM Inference Serving
+## Part 5: Running LLM Inference
 
-After training completes, deploy the model for users to query:
+### 5.1 Serving a Trained Model
 
-### 5.1 vLLM Inference Deployment
+After training, we deploy the model as an always-on API service. Inference has very different requirements from training:
+
+```
+Training vs Inference — different needs:
+
+Training:                          Inference:
+- Uses ALL GPUs for ONE job        - Uses a FEW GPUs per model copy
+- Runs for days/weeks              - Runs forever (always-on service)
+- Maximum throughput needed        - Low latency per request needed
+- Batch size: large                - Batch size: varies (1 to hundreds)
+- No autoscaling needed            - Autoscaling crucial (traffic varies)
+- Failure = restart from checkpoint- Failure = users see errors
+```
 
 ```yaml
-# file: llm-serving.yaml
+# llm-inference.yaml
+# Deploys LLaMA-70B as an API service using vLLM
+# Autoscales from 2 to 6 replicas based on GPU utilization
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: llama-70b-serving
+  name: llama-70b-inference
   namespace: inference
 spec:
-  replicas: 2                  # 2 replicas for high availability
+  replicas: 2                    # Start with 2 copies of the model
   selector:
     matchLabels:
-      app: llama-serving
+      app: llama-70b
   template:
     metadata:
       labels:
-        app: llama-serving
+        app: llama-70b
     spec:
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-SXM
       tolerations:
       - key: "nvidia.com/gpu"
-        operator: "Equal"
-        value: "present"
+        operator: "Exists"
         effect: "NoSchedule"
       containers:
       - name: vllm
         image: vllm/vllm-openai:latest
         args:
-        - --model=/models/llama-70b          # Path to trained model
-        - --tensor-parallel-size=8           # Use all 8 GPUs on the node
-        - --max-model-len=4096               # Maximum sequence length
-        - --gpu-memory-utilization=0.90      # Use 90% of GPU memory
-        - --enable-chunked-prefill           # Better scheduling of requests
+        - --model=/models/llama-70b         # Path to trained model
+        - --tensor-parallel-size=4          # Split across 4 GPUs (NVLink)
+        - --max-model-len=8192              # Max context length
+        - --gpu-memory-utilization=0.90     # Use 90% of GPU memory
+        - --dtype=bfloat16                  # BF16 precision
+        - --port=8000                       # API port
         ports:
         - containerPort: 8000
-          name: http
+        env:
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: NCCL_SOCKET_IFNAME
+          value: "ib0"
         resources:
           limits:
-            nvidia.com/gpu: 8
-            memory: "512Gi"
+            nvidia.com/gpu: 4               # 4 GPUs per replica
+            memory: "256Gi"
+            cpu: "32"
           requests:
-            nvidia.com/gpu: 8
-            memory: "512Gi"
+            nvidia.com/gpu: 4
+            memory: "256Gi"
+            cpu: "32"
+        # Health check: make sure the model is loaded and responding
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120          # Model takes ~2 min to load
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 180
+          periodSeconds: 30
         volumeMounts:
-        - name: model-storage
+        - name: model-weights
           mountPath: /models
+          readOnly: true
+        - name: dev-shm
+          mountPath: /dev/shm
       volumes:
-      - name: model-storage
+      - name: model-weights
         persistentVolumeClaim:
-          claimName: model-storage-pvc       # PVC pointing to trained model files
+          claimName: model-weights-pvc      # Trained model weights
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "64Gi"
+
 ---
-# Expose the service
+# Service: Makes the model accessible within the cluster
 apiVersion: v1
 kind: Service
 metadata:
-  name: llama-serving-svc
+  name: llama-70b-service
   namespace: inference
 spec:
   selector:
-    app: llama-serving
+    app: llama-70b
   ports:
   - port: 8000
     targetPort: 8000
-    name: http
-  type: LoadBalancer                         # External access
+    protocol: TCP
+  type: ClusterIP                 # Internal access only
+
 ---
-# Auto-scale based on GPU utilization
+# Ingress: Makes the model accessible from outside the cluster
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llama-70b-ingress
+  namespace: inference
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  rules:
+  - host: llm-api.mycompany.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: llama-70b-service
+            port:
+              number: 8000
+
+---
+# Autoscaler: Automatically add/remove replicas based on demand
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: llama-hpa
+  name: llama-70b-hpa
   namespace: inference
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: llama-70b-serving
-  minReplicas: 2                             # Always have at least 2 running
-  maxReplicas: 6                             # Scale up to 6 during peak traffic
+    name: llama-70b-inference
+  minReplicas: 2                  # Always keep at least 2 copies running
+  maxReplicas: 6                  # Scale up to 6 copies during peak traffic
   metrics:
   - type: Pods
     pods:
       metric:
-        name: DCGM_FI_DEV_GPU_UTIL          # Scale based on GPU utilization
+        name: gpu_utilization     # Scale based on GPU usage
       target:
         type: AverageValue
-        averageValue: "80"                   # Add more replicas when GPUs > 80% busy
+        averageValue: "80"        # Add more replicas when GPUs > 80% busy
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 120   # Wait 2 min before scaling up
+      policies:
+      - type: Pods
+        value: 1                  # Add 1 replica at a time
+        periodSeconds: 120
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Wait 5 min before scaling down
+      policies:
+      - type: Pods
+        value: 1                  # Remove 1 replica at a time
+        periodSeconds: 300
 ```
 
-```bash
-# Deploy
-kubectl apply -f llm-serving.yaml
+**What this setup does:**
 
-# Test the API
-curl http://<LOAD_BALANCER_IP>:8000/v1/chat/completions \
+```
+Normal traffic (2 replicas):
+  llama-70b-inference-pod-0  →  4 GPUs on Node 0  →  handles requests
+  llama-70b-inference-pod-1  →  4 GPUs on Node 1  →  handles requests
+  (remaining 48 GPUs free for training or other models)
+
+Peak traffic (autoscales to 6 replicas):
+  llama-70b-inference-pod-0  →  4 GPUs on Node 0
+  llama-70b-inference-pod-1  →  4 GPUs on Node 1
+  llama-70b-inference-pod-2  →  4 GPUs on Node 2  ← added automatically
+  llama-70b-inference-pod-3  →  4 GPUs on Node 3  ← added automatically
+  llama-70b-inference-pod-4  →  4 GPUs on Node 4  ← added automatically
+  llama-70b-inference-pod-5  →  4 GPUs on Node 5  ← added automatically
+
+Traffic drops back (autoscales down):
+  Extra replicas are removed after 5 minutes of low usage
+  GPUs are freed for other workloads
+```
+
+### 5.2 Using the Inference API
+
+Once deployed, users can call the model:
+
+```bash
+# Send a request to the LLM API
+curl https://llm-api.mycompany.com/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama-70b",
-    "messages": [{"role": "user", "content": "What is machine learning?"}],
-    "max_tokens": 200
+    "prompt": "Explain quantum computing in simple terms:",
+    "max_tokens": 256,
+    "temperature": 0.7
   }'
-```
 
-**How autoscaling works:**
-
-```
-Low traffic (2 AM):
-  2 replicas running (minimum)
-  GPU utilization: 20%
-  HPA: "GPUs are underutilized, no need to scale"
-
-Peak traffic (2 PM):
-  2 replicas running
-  GPU utilization: 90% (above 80% threshold!)
-  HPA: "GPUs are overloaded, scaling up!"
-  → Creates replica 3, then 4
-  GPU utilization drops to 55%
-  HPA: "That's better, holding at 4 replicas"
-
-Traffic drops (8 PM):
-  4 replicas running
-  GPU utilization: 30%
-  HPA: "GPUs are mostly idle, scaling down"
-  → Removes replicas back to 2
+# Response:
+# {
+#   "choices": [{
+#     "text": "Quantum computing uses quantum bits (qubits) that can be
+#              in multiple states at once, unlike classical bits that are
+#              either 0 or 1. This allows quantum computers to explore
+#              many solutions simultaneously..."
+#   }]
+# }
 ```
 
 ---
 
-## Step 6: Monitor and Maintain the Cluster
+## Part 6: Putting It All Together — How Data Flows
 
-### 6.1 What to Monitor
+Let's trace exactly what happens during **one training step** across our entire cluster:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Cluster Health Dashboard                   │
-│                                                              │
-│  ── GPU Health ──────────────────────────────────────────    │
-│  GPU Utilization (per node):    [████████░░] 82%             │
-│  Tensor Core Activity:          [█████████░] 91%             │
-│  GPU Memory Used:               72/80 GB per GPU             │
-│  GPU Temperature:               71°C (OK, throttle at 83°C) │
-│  Power Draw:                    650W / 700W TDP              │
-│                                                              │
-│  ── Network Health ─────────────────────────────────────     │
-│  NVLink Bandwidth (intra-node): 850 / 900 GB/s (94%)        │
-│  InfiniBand Bandwidth:          180 / 200 GB/s (90%)        │
-│  IB Port Errors:                0 (good!)                    │
-│  NCCL All-Reduce Time:          12 ms per step               │
-│                                                              │
-│  ── Training Progress ──────────────────────────────────     │
-│  Tokens per second:             420,000                      │
-│  MFU:                           52%                          │
-│  Current Loss:                  2.34 (decreasing)            │
-│  Step:                          45,231 / 500,000             │
-│  ETA:                           ██████████████░░░░ 65%       │
-│                                                              │
-│  ── Cluster Resources ──────────────────────────────────     │
-│  Total GPUs: 64    Used: 48    Free: 16                      │
-│  Active Jobs: 3    Queued: 7                                 │
-│  Storage Used: 45 TB / 100 TB (45%)                          │
-└─────────────────────────────────────────────────────────────┘
-```
+STEP-BY-STEP: What happens when our 64 GPUs process one training batch
 
-### 6.2 Common Issues and How to Fix Them
+═══════════════════════════════════════════════════════════════
+PHASE 1: DATA LOADING
+═══════════════════════════════════════════════════════════════
 
-| Problem | Symptom | How to Diagnose | Fix |
-|---------|---------|-----------------|-----|
-| GPU not detected | `nvidia.com/gpu: 0` in node description | `kubectl describe node`, check GPU Operator pods | Restart GPU Operator, check driver |
-| InfiniBand down | Training hangs, NCCL timeout errors | `ibstat` on the node, check NCCL_DEBUG logs | Check cable, restart IB driver |
-| NCCL using TCP instead of IB | Very slow training, NCCL logs say "Using network Socket" | Set `NCCL_DEBUG=INFO`, look for transport | Set `NCCL_IB_DISABLE=0`, `NCCL_SOCKET_IFNAME=ib0` |
-| GPU thermal throttling | Performance drops after 30+ minutes | `nvidia-smi -q -d TEMPERATURE` | Check cooling, reduce power limit |
-| OOM (Out of Memory) | Pod crashes with CUDA OOM | Check `torch.cuda.max_memory_allocated()` | Reduce batch size, enable activation checkpointing |
-| Pod stuck in Pending | Job won't start | `kubectl describe pod <name>` | Check if GPUs are available, check taints/tolerations |
-| Slow data loading | GPU utilization drops to 0% periodically | Profile with Nsight Systems, check CPU usage | More DataLoader workers, faster storage, prefetch |
-| Checkpoint write is slow | Training pauses during checkpointing | Measure checkpoint time | Use async checkpointing, faster storage |
+Lustre Storage → NVMe Cache → CPU RAM → GPU Memory
 
-### 6.3 Alerting Rules
+Each server's CPU loads 4 sequences (4096 tokens each) from storage.
+8 servers × 4 sequences = 32 sequences total (global batch).
+CPUs tokenize and transfer data to their GPUs via PCIe.
 
-Set up Prometheus alerts for critical issues:
+Hardware used: CPU, NVMe SSD, PCIe
+NCCL: not involved
 
-```yaml
-# Prometheus alerting rules
-groups:
-- name: gpu-alerts
-  rules:
-  # Alert if GPU temperature is dangerously high
-  - alert: GPUTemperatureCritical
-    expr: DCGM_FI_DEV_GPU_TEMP > 83
-    for: 5m
-    labels:
-      severity: critical
-    annotations:
-      summary: "GPU {{ $labels.gpu }} on {{ $labels.node }} is overheating ({{ $value }}°C)"
+═══════════════════════════════════════════════════════════════
+PHASE 2: FORWARD PASS (per transformer layer × 80 layers)
+═══════════════════════════════════════════════════════════════
 
-  # Alert if a GPU has errors
-  - alert: GPUXidErrors
-    expr: DCGM_FI_DEV_XID_ERRORS > 0
-    for: 1m
-    labels:
-      severity: warning
-    annotations:
-      summary: "GPU {{ $labels.gpu }} reporting XID errors — may need replacement"
+Inside each server (Tensor Parallelism over NVLink):
+┌──────────────────────────────────────────┐
+│ Server 0: 8 GPUs each compute 1/8 of    │
+│ the attention and MLP for their data     │
+│                                          │
+│ GPU 0: heads 0-7    GPU 4: heads 32-39  │
+│ GPU 1: heads 8-15   GPU 5: heads 40-47  │
+│ GPU 2: heads 16-23  GPU 6: heads 48-55  │
+│ GPU 3: heads 24-31  GPU 7: heads 56-63  │
+│                                          │
+│ After attention: NCCL All-Reduce on      │
+│ NVLink (900 GB/s) to combine results    │
+│ Time: ~0.05 ms per layer                │
+│                                          │
+│ After MLP: NCCL All-Reduce on NVLink    │
+│ Time: ~0.05 ms per layer                │
+└──────────────────────────────────────────┘
 
-  # Alert if InfiniBand has errors
-  - alert: InfiniBandErrors
-    expr: node_infiniband_port_data_received_bytes_total == 0
-    for: 10m
-    labels:
-      severity: critical
-    annotations:
-      summary: "InfiniBand port on {{ $labels.node }} has no traffic — link may be down"
+All 8 servers do this SIMULTANEOUSLY on different data.
+Hardware used: GPU Tensor Cores, NVLink
+NCCL: All-Reduce within each server
 
-  # Alert if training throughput drops significantly
-  - alert: TrainingThroughputDrop
-    expr: training_tokens_per_second < 300000
-    for: 15m
-    labels:
-      severity: warning
-    annotations:
-      summary: "Training throughput dropped to {{ $value }} tokens/s (expected >400K)"
+═══════════════════════════════════════════════════════════════
+PHASE 3: LOSS COMPUTATION
+═══════════════════════════════════════════════════════════════
+
+Each GPU computes loss on its portion of data.
+Compare model's predictions vs actual next tokens.
+
+Hardware used: GPU
+NCCL: not involved (local computation)
+
+═══════════════════════════════════════════════════════════════
+PHASE 4: BACKWARD PASS + GRADIENT SYNC
+═══════════════════════════════════════════════════════════════
+
+This is the MOST communication-heavy phase.
+
+Step A: Each GPU computes gradients locally (backward through layers)
+Step B: Gradients must be AVERAGED across all 64 GPUs
+
+The gradient sync uses NCCL All-Reduce ACROSS servers:
+
+Server 0                    Server 1              Server 7
+GPU 0-7                    GPU 8-15              GPU 56-63
+  │                          │                      │
+  │  gradients (140 GB)      │  gradients           │  gradients
+  │                          │                      │
+  └──────────────────────────┼──────────────────────┘
+                             │
+                    NCCL All-Reduce
+                    over InfiniBand
+                    (400 GB/s per node)
+                             │
+                    Algorithm: Ring
+                    (bandwidth-optimal)
+                             │
+                    Time: ~1-2 seconds
+                    for 70B model gradients
+                             │
+  ┌──────────────────────────┼──────────────────────┐
+  │                          │                      │
+  │  averaged gradients      │  averaged gradients  │  averaged gradients
+  │  (identical on all GPUs) │                      │
+Server 0                    Server 1              Server 7
+
+Hardware used: InfiniBand (inter-node), NVLink (intra-node)
+NCCL: All-Reduce across entire cluster
+
+═══════════════════════════════════════════════════════════════
+PHASE 5: OPTIMIZER UPDATE
+═══════════════════════════════════════════════════════════════
+
+Each GPU uses the averaged gradients to update its portion of
+the model weights. All GPUs update independently (no communication).
+
+Hardware used: GPU
+NCCL: not involved
+
+═══════════════════════════════════════════════════════════════
+PHASE 6: REPEAT
+═══════════════════════════════════════════════════════════════
+
+Go back to Phase 1 with the next batch of training data.
+Repeat millions of times until the model is trained.
 ```
 
 ---
 
-## Complete Architecture Summary
+## Part 7: Complete Hardware Bill of Materials
+
+Here is everything you need to buy and build this cluster:
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    COMPLETE HPC CLUSTER FOR LLMs                  │
-│                                                                  │
-│  ┌──── Kubernetes Control Plane ──────────────────────────────┐  │
-│  │  API Server + Scheduler + etcd + Controller Manager        │  │
-│  │  + GPU Operator + Kubeflow Training Operator               │  │
-│  │  + Volcano Scheduler + Prometheus/Grafana                  │  │
-│  └────────────────────────┬───────────────────────────────────┘  │
-│                           │                                      │
-│  ┌────────────────────────▼───────────────────────────────────┐  │
-│  │              InfiniBand NDR Fat-Tree Network                │  │
-│  │         (Quantum-2 switches, 400 Gb/s per port)            │  │
-│  │                                                            │  │
-│  │    ┌──────────────┐     ┌──────────────┐                   │  │
-│  │    │ Core Switch  │     │ Core Switch  │                   │  │
-│  │    └──┬────┬──┬───┘     └──┬────┬──┬───┘                   │  │
-│  │       │    │  │            │    │  │                        │  │
-│  │    ┌──▼──┐│┌─▼───┐     ┌──▼──┐│┌─▼───┐                    │  │
-│  │    │Leaf ││ │Leaf │     │Leaf ││ │Leaf │                    │  │
-│  │    │SW 0 ││ │SW 1 │     │SW 2 ││ │SW 3 │                    │  │
-│  │    └┬┬┬┬─┘│ └┬┬┬┬─┘     └┬┬┬┬─┘│ └┬┬┬┬─┘                    │  │
-│  └─────┼┼┼┼──┼──┼┼┼┼──────┼┼┼┼──┼──┼┼┼┼──────────────────────┘  │
-│        ││││  │  ││││      ││││  │  ││││                          │
-│  ┌─────▼▼▼▼──┘  ▼▼▼▼──┐  ┌▼▼▼▼──┘  ▼▼▼▼──┐                    │
-│  │  GPU Server 0-3     │  │  GPU Server 4-7 │                    │
-│  │                     │  │                 │    ×N servers       │
-│  │  Per server:        │  │  Per server:    │                    │
-│  │  • 8× H100 SXM GPU │  │  • 8× H100 GPU │                    │
-│  │  • NVSwitch 900GB/s │  │  • NVSwitch     │                    │
-│  │  • 8× ConnectX-7 IB │  │  • 8× CX-7 IB  │                    │
-│  │  • 2× EPYC CPU     │  │  • 2× EPYC CPU  │                    │
-│  │  • 2 TB RAM         │  │  • 2 TB RAM     │                    │
-│  │  • 30 TB NVMe SSD  │  │  • 30 TB NVMe   │                    │
-│  └─────────────────────┘  └─────────────────┘                    │
-│        │                        │                                │
-│  ┌─────▼────────────────────────▼──────────────────────────────┐ │
-│  │              Shared Storage (Lustre / GPFS)                  │ │
-│  │         Multiple storage servers with HDDs/SSDs              │ │
-│  │         Training data, model checkpoints, logs               │ │
-│  │         Capacity: 100+ TB, Throughput: 100+ GB/s            │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌── Software Stack (on every GPU server) ─────────────────────┐ │
-│  │  Ubuntu 22.04 → NVIDIA Driver → CUDA 12 → cuDNN → NCCL    │ │
-│  │  → containerd → NVIDIA Container Toolkit → kubelet          │ │
-│  │  → PyTorch → DeepSpeed/Megatron-LM → Your training code    │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│           HARDWARE BILL OF MATERIALS (8-Node Cluster)          │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  COMPUTE (8 servers):                                          │
+│  ├── 8× GPU Server (DGX H100 or equivalent)                   │
+│  │   ├── 2× AMD EPYC 9654 CPUs (96 cores each)               │
+│  │   ├── 2 TB DDR5 RAM                                        │
+│  │   ├── 8× NVIDIA H100 SXM 80GB GPUs                        │
+│  │   ├── 4× NVSwitch chips (connect all 8 GPUs)              │
+│  │   ├── 8× ConnectX-7 InfiniBand NICs (400 Gb/s each)       │
+│  │   ├── 8× 3.84 TB NVMe SSDs                                │
+│  │   └── 2× 3000W power supplies                              │
+│  │                                                             │
+│  NETWORKING:                                                   │
+│  ├── 2× NVIDIA QM9700 Leaf Switches (64-port 400 Gb/s)       │
+│  ├── 2× NVIDIA QM9700 Core Switches (full bisection BW)      │
+│  ├── ~80× InfiniBand cables (400 Gb/s, various lengths)       │
+│  ├── 2× Ethernet management switches (for Kubernetes control) │
+│  │                                                             │
+│  STORAGE:                                                      │
+│  ├── Lustre Parallel File System                               │
+│  │   ├── 2× Metadata Servers (MDS)                            │
+│  │   ├── 4× Object Storage Servers (OSS)                      │
+│  │   ├── 48× 16 TB NVMe SSDs (768 TB usable)                 │
+│  │   └── InfiniBand-connected to all compute nodes            │
+│  │                                                             │
+│  INFRASTRUCTURE:                                               │
+│  ├── 2× 42U server racks                                      │
+│  ├── Cooling: liquid cooling for GPU servers (~80 kW total)    │
+│  ├── Power: 100 kW power delivery (with redundancy)           │
+│  ├── UPS: Uninterruptible power supply                         │
+│  └── 1× Management/login server (for Kubernetes control plane)│
+│                                                                │
+│  SOFTWARE (free / open-source):                                │
+│  ├── Ubuntu 22.04 Server (operating system)                    │
+│  ├── Kubernetes v1.28+ (cluster orchestration)                 │
+│  ├── NVIDIA GPU Operator (GPU drivers + management)           │
+│  ├── Volcano (batch scheduling)                                │
+│  ├── Kubeflow Training Operator (distributed training)        │
+│  ├── NVIDIA NCCL (GPU communication)                          │
+│  ├── PyTorch + DeepSpeed (training framework)                 │
+│  ├── vLLM (inference serving)                                  │
+│  ├── Prometheus + Grafana (monitoring)                         │
+│  └── Multus + RDMA device plugin (InfiniBand for K8s)         │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 8: Summary — How Everything Connects
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    COMPLETE ARCHITECTURE                      │
+│                                                              │
+│  Layer 5: APPLICATION                                        │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ Training: PyTorch + DeepSpeed + Megatron-LM         │    │
+│  │ Inference: vLLM + Triton Inference Server            │    │
+│  │ "These are the programs that actually train/run LLMs"│    │
+│  └──────────────────────┬──────────────────────────────┘    │
+│                         │ uses                               │
+│  Layer 4: COMMUNICATION │                                    │
+│  ┌──────────────────────▼──────────────────────────────┐    │
+│  │ NCCL (GPU-to-GPU data movement)                     │    │
+│  │ "Automatically finds the fastest path between GPUs   │    │
+│  │  and moves data using optimal algorithms"            │    │
+│  └──────────────────────┬──────────────────────────────┘    │
+│                         │ runs on                            │
+│  Layer 3: SCHEDULING    │                                    │
+│  ┌──────────────────────▼──────────────────────────────┐    │
+│  │ Kubernetes + Volcano + Kubeflow Training Operator    │    │
+│  │ "Decides which jobs run on which GPUs, manages       │    │
+│  │  failures, autoscales inference"                     │    │
+│  └──────────────────────┬──────────────────────────────┘    │
+│                         │ manages                            │
+│  Layer 2: NETWORKING    │                                    │
+│  ┌──────────────────────▼──────────────────────────────┐    │
+│  │ NVLink (900 GB/s inside servers)                    │    │
+│  │ InfiniBand (400 Gb/s between servers)               │    │
+│  │ "The physical roads that data travels on"            │    │
+│  └──────────────────────┬──────────────────────────────┘    │
+│                         │ connects                           │
+│  Layer 1: HARDWARE      │                                    │
+│  ┌──────────────────────▼──────────────────────────────┐    │
+│  │ 64× NVIDIA H100 GPUs (8 servers × 8 GPUs)          │    │
+│  │ 2 TB RAM per server, NVMe SSDs, Lustre storage      │    │
+│  │ "The physical machines that do the actual compute"   │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Key Takeaways
 
-1. **GPUs are the workers, NVLink is the fast internal highway, InfiniBand is the fast external highway, NCCL is the traffic controller, and Kubernetes is the job assignment office.** Each piece has a specific role, and they all work together.
+1. **GPUs are the workers, NVLink is the fast hallway inside a building, InfiniBand is the highway between buildings.** You need both for LLM training because one server doesn't have enough GPUs.
 
-2. **NVLink (intra-node) is ~4-18× faster than InfiniBand (inter-node).** This is why tensor parallelism (heavy communication) goes within a server, and data/pipeline parallelism (lighter communication) goes across servers.
+2. **NCCL is not an accelerator — it's the communication library.** It sits between your training code and the hardware, automatically choosing the fastest way to move data between GPUs. Without NCCL, your GPUs would spend most of their time waiting for data instead of computing.
 
-3. **NCCL automatically figures out the fastest path.** You configure the environment variables to tell NCCL what hardware exists, and it handles the rest — choosing NVLink vs InfiniBand, Ring vs Tree algorithm, etc.
+3. **NVLink handles intra-node communication (tensor parallelism)** — splitting individual layers across GPUs within one server. It's 14× faster than PCIe, which matters because this happens every layer, every step.
 
-4. **Kubernetes needs extra components for GPU workloads:** GPU Operator (hardware), Kubeflow Training Operator (distributed training), Volcano (batch scheduling), and host networking (InfiniBand access).
+4. **InfiniBand handles inter-node communication (data parallelism)** — synchronizing gradients across servers. GPUDirect RDMA is critical — it lets GPUs send data to the network without involving the CPU.
 
-5. **Always verify each layer works before building the next:** First confirm GPUs work (`nvidia-smi`), then NVLink (`p2pBandwidthLatencyTest`), then InfiniBand (`ibstat`, `ib_write_bw`), then NCCL (`nccl-tests`), then Kubernetes (`kubectl get nodes`), then run a small training test before the real job.
+5. **Kubernetes manages the cluster** — assigning GPUs to jobs, restarting failed containers, autoscaling inference replicas. Volcano adds gang scheduling (start all pods together or none). Kubeflow adds distributed training support.
 
-6. **For production, use both SLURM and Kubernetes:** Many organizations run SLURM for large-scale training (maximum performance on bare metal) and Kubernetes for inference serving (autoscaling, API management). The guide above uses Kubernetes for both, which works well for medium-scale clusters but sacrifices some training performance due to container/network overhead.
+6. **Always test NCCL performance with nccl-tests before training.** Many "slow training" problems are actually network misconfigurations. If nccl-tests shows low bandwidth, fix the network first.
 
-7. **Monitor everything.** GPU temperature, utilization, InfiniBand errors, training loss, tokens/s — set up dashboards and alerts so you catch problems before they waste days of training.
+7. **Training and inference have very different requirements.** Training needs all GPUs working together for days. Inference needs a few GPUs per model copy, with autoscaling for variable traffic. Kubernetes handles both on the same cluster.
+
+8. **The software is all free and open-source.** The expensive part is the hardware — 8 DGX H100 servers cost roughly $2-3 million. The software stack (Kubernetes, NCCL, PyTorch, vLLM) costs nothing.
