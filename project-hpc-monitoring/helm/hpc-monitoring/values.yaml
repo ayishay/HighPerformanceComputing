@@ -1,0 +1,73 @@
+# Default values for hpc-monitoring chart
+
+# -- Prometheus --
+prometheus:
+  enabled: true
+  server:
+    persistentVolume:
+      enabled: false
+    retention: "7d"
+  alertmanager:
+    enabled: false
+
+# -- Grafana --
+grafana:
+  enabled: true
+  adminPassword: "admin"
+  service:
+    type: NodePort
+    nodePort: 30300
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: "default"
+          orgId: 1
+          folder: "HPC"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+  dashboardsConfigMaps:
+    default: "grafana-dashboards"
+
+# -- DCGM Exporter --
+dcgmExporter:
+  enabled: true
+  image:
+    repository: nvcr.io/nvidia/k8s/dcgm-exporter
+    tag: "3.3.0-3.2.0-ubuntu22.04"
+  service:
+    port: 9400
+
+# -- Custom GPU Exporter (fallback) --
+gpuExporter:
+  enabled: true
+  image:
+    repository: hpc-monitoring/gpu-exporter
+    tag: "latest"
+  replicas: 1
+  service:
+    port: 9090
+
+# -- NCCL Metrics Exporter --
+ncclExporter:
+  enabled: true
+  image:
+    repository: hpc-monitoring/nccl-exporter
+    tag: "latest"
+  replicas: 1
+  service:
+    port: 9091
+  resultsFile: "/data/nccl_profile_results.json"
+
+# -- Scheduling Recommender --
+recommender:
+  enabled: true
+  image:
+    repository: hpc-monitoring/recommender
+    tag: "latest"
+  schedule: "*/30 * * * *"  # run every 30 minutes as a CronJob
+  prometheusUrl: "http://prometheus-server:9090"
+  analysisWindow: "1h"

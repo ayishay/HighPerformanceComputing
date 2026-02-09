@@ -1,0 +1,151 @@
+{{- if .Values.recommender.enabled }}
+# CronJob that runs the scheduling recommender periodically
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gpu-recommender
+  labels:
+    app: gpu-recommender
+spec:
+  schedule: "{{ .Values.recommender.schedule }}"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: recommender
+              image: "{{ .Values.recommender.image.repository }}:{{ .Values.recommender.image.tag }}"
+              command:
+                - python3
+                - -m
+                - src.recommender.recommender
+                - --prometheus-url
+                - "{{ .Values.recommender.prometheusUrl }}"
+                - --window
+                - "{{ .Values.recommender.analysisWindow }}"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+{{- end }}
+---
+{{- if .Values.ncclExporter.enabled }}
+# NCCL Metrics Exporter Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nccl-exporter
+  labels:
+    app: nccl-exporter
+spec:
+  replicas: {{ .Values.ncclExporter.replicas }}
+  selector:
+    matchLabels:
+      app: nccl-exporter
+  template:
+    metadata:
+      labels:
+        app: nccl-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.ncclExporter.service.port }}"
+    spec:
+      containers:
+        - name: nccl-exporter
+          image: "{{ .Values.ncclExporter.image.repository }}:{{ .Values.ncclExporter.image.tag }}"
+          command:
+            - python3
+            - -m
+            - src.nccl_profiler.export_metrics
+            - --port
+            - "{{ .Values.ncclExporter.service.port }}"
+            - --results-file
+            - "{{ .Values.ncclExporter.resultsFile }}"
+          ports:
+            - containerPort: {{ .Values.ncclExporter.service.port }}
+              name: metrics
+          volumeMounts:
+            - name: nccl-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: nccl-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nccl-exporter
+  labels:
+    app: nccl-exporter
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.ncclExporter.service.port }}
+      targetPort: metrics
+      name: metrics
+  selector:
+    app: nccl-exporter
+{{- end }}
+---
+{{- if .Values.gpuExporter.enabled }}
+# Custom GPU Exporter Deployment (fallback for non-DCGM environments)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-exporter
+  labels:
+    app: gpu-exporter
+spec:
+  replicas: {{ .Values.gpuExporter.replicas }}
+  selector:
+    matchLabels:
+      app: gpu-exporter
+  template:
+    metadata:
+      labels:
+        app: gpu-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.gpuExporter.service.port }}"
+    spec:
+      containers:
+        - name: gpu-exporter
+          image: "{{ .Values.gpuExporter.image.repository }}:{{ .Values.gpuExporter.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.gpuExporter.service.port }}
+              name: metrics
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              nvidia.com/gpu: 0
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-exporter
+  labels:
+    app: gpu-exporter
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.gpuExporter.service.port }}
+      targetPort: metrics
+      name: metrics
+  selector:
+    app: gpu-exporter
+{{- end }}

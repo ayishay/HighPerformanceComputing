@@ -1,0 +1,28 @@
+# ConfigMap for Grafana dashboard provisioning
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  labels:
+    app: grafana
+data:
+  gpu_monitoring.json: |
+    {{ .Files.Get "dashboards/gpu_monitoring.json" | indent 4 }}
+---
+# ConfigMap for Grafana datasource provisioning
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  labels:
+    app: grafana
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus-server:9090
+        isDefault: true
+        editable: true

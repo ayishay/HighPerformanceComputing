@@ -1,0 +1,65 @@
+{{- if .Values.dcgmExporter.enabled }}
+# DCGM Exporter DaemonSet - runs on every GPU node to export GPU hardware metrics
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  labels:
+    app: dcgm-exporter
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app: dcgm-exporter
+    spec:
+      containers:
+        - name: dcgm-exporter
+          image: "{{ .Values.dcgmExporter.image.repository }}:{{ .Values.dcgmExporter.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.dcgmExporter.service.port }}
+              name: metrics
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+          env:
+            - name: DCGM_EXPORTER_LISTEN
+              value: ":{{ .Values.dcgmExporter.service.port }}"
+            - name: DCGM_EXPORTER_KUBERNETES
+              value: "true"
+          volumeMounts:
+            - name: pod-resources
+              mountPath: /var/lib/kubelet/pod-resources
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dcgm-exporter
+  labels:
+    app: dcgm-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "{{ .Values.dcgmExporter.service.port }}"
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.dcgmExporter.service.port }}
+      targetPort: metrics
+      name: metrics
+  selector:
+    app: dcgm-exporter
+{{- end }}
