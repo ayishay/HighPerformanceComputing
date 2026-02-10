@@ -7,12 +7,13 @@
 3. [What Are Guardrails?](#3-what-are-guardrails)
 4. [The Solution: Three-Tier Guardrail Model](#4-the-solution-three-tier-guardrail-model)
 5. [Guardrail Template Library](#5-guardrail-template-library)
-6. [Risk Assessment Framework](#6-risk-assessment-framework)
-7. [Governance Process](#7-governance-process)
-8. [Risk-Tiered Oversight](#8-risk-tiered-oversight)
-9. [Continuous Improvement Loop](#9-continuous-improvement-loop)
-10. [Roles and Responsibilities](#10-roles-and-responsibilities)
-11. [Summary](#11-summary)
+6. [Tier 3 Self-Service Portal: A No-Code Guide for Business Teams](#6-tier-3-self-service-portal-a-no-code-guide-for-business-teams)
+7. [Risk Assessment Framework](#7-risk-assessment-framework)
+8. [Governance Process](#8-governance-process)
+9. [Risk-Tiered Oversight](#9-risk-tiered-oversight)
+10. [Continuous Improvement Loop](#10-continuous-improvement-loop)
+11. [Roles and Responsibilities](#11-roles-and-responsibilities)
+12. [Summary](#12-summary)
 
 ---
 
@@ -436,7 +437,610 @@ guardrails:
 
 ---
 
-## 6. Risk Assessment Framework
+## 6. Tier 3 Self-Service Portal: A No-Code Guide for Business Teams
+
+### The Problem This Section Solves
+
+Tier 3 guardrails are owned by **use case owners** — and in most banks, these owners are **business people**, not engineers. They are loan officers, compliance analysts, marketing managers, operations leads. They understand their business deeply, but they do not write code, edit YAML files, or configure technical systems.
+
+So how do they set up Tier 3 guardrails?
+
+The answer: **they fill out forms.** The platform team builds a self-service web portal (think of it like an internal website) where business teams answer plain-English questions, pick options from dropdowns, and toggle switches. Behind the scenes, the portal automatically translates those form answers into the technical guardrail configuration. The business user never sees code, never touches a config file, and never needs to understand the underlying technology.
+
+### How It Works: The Big Picture
+
+```
+WHAT THE BUSINESS USER SEES          WHAT HAPPENS BEHIND THE SCENES
+================================     =====================================
+
+Step 1: Open the portal website  →   Portal loads their use case info
+                                      (name, domain, risk tier) from
+                                      the registration in Step 1-4
+                                      of the Governance Process
+
+Step 2: Answer guided questions  →   Portal maps answers to guardrail
+        via forms and dropdowns       module IDs and parameter values
+
+Step 3: Review a plain-English   →   Portal generates the technical
+        summary of their choices      YAML/JSON configuration file
+
+Step 4: Click "Submit for        →   Configuration enters the review
+        Review"                       and approval workflow (Section 8)
+
+Step 5: Receive approval         →   Platform team deploys the
+        notification                  configuration to production
+```
+
+The key insight: **the business user's experience is entirely form-based**. Everything technical is abstracted away.
+
+### Architecture: How Forms Become Guardrails
+
+Below is the full architecture of the self-service portal, from the business user's browser to the running guardrail in production.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                   │
+│   LAYER 1: SELF-SERVICE WEB PORTAL (what business users see)     │
+│                                                                   │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│   │  Step 1   │  │  Step 2   │  │  Step 3   │  │  Step 4   │       │
+│   │  Use Case │→│  Guardrail│→│  Review & │→│  Submit   │       │
+│   │  Info     │  │  Question-│  │  Confirm  │  │  for      │       │
+│   │  (auto-   │  │  naire    │  │  (plain   │  │  Approval │       │
+│   │  filled)  │  │  (forms)  │  │  English) │  │           │       │
+│   └──────────┘  └──────────┘  └──────────┘  └──────────┘       │
+│                                                                   │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   LAYER 2: TRANSLATION ENGINE (invisible to business users)      │
+│                                                                   │
+│   • Maps form answers → guardrail module IDs + parameters        │
+│   • Applies business rules (e.g., HIGH risk → human review       │
+│     is mandatory, cannot be skipped)                              │
+│   • Merges with auto-applied Tier 1 and Tier 2 configs           │
+│   • Validates: are all required guardrails present for this       │
+│     risk tier? Flags gaps before submission.                      │
+│   • Generates the technical config (YAML/JSON)                   │
+│                                                                   │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   LAYER 3: REVIEW & APPROVAL WORKFLOW                            │
+│                                                                   │
+│   • Routes to the right approver based on risk tier               │
+│   • LOW → auto-approved if validation passes                     │
+│   • MEDIUM → domain risk lead reviews                            │
+│   • HIGH → 2nd Line of Defense reviews                           │
+│   • CRITICAL → risk committee reviews                            │
+│   • Approver sees BOTH the plain-English summary AND the         │
+│     generated technical config                                    │
+│                                                                   │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   LAYER 4: DEPLOYMENT PIPELINE (handled by platform team)        │
+│                                                                   │
+│   • Approved config is version-controlled (audit trail)          │
+│   • Deployed to the guardrail engine                              │
+│   • Tier 1 + Tier 2 + Tier 3 configs merged at runtime           │
+│   • Monitoring and alerting activated                             │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### What the Forms Actually Look Like
+
+Below is what the business user actually sees — step by step — when they configure Tier 3 guardrails through the portal. Each section of the form corresponds to a guardrail module from the Template Library (Section 5), but the user never needs to know module IDs or technical details.
+
+#### Form Section 1: Use Case Identity (Auto-Filled)
+
+This section is pre-populated from the use case registration. The business user just confirms it is correct.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  GUARDRAIL CONFIGURATION PORTAL                              │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  Use Case Name:     [Commercial Lending - Credit Memo       │
+│                      Summarizer                        ]     │
+│  Use Case ID:       UC-2024-0387                             │
+│  Owner:             J. Smith, Commercial Lending             │
+│  Business Domain:   Commercial Banking (auto-detected)       │
+│  Risk Tier:         HIGH (calculated from risk assessment)   │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ ℹ  Because your use case is in "Commercial Banking" │    │
+│  │    and is rated HIGH risk, the following guardrails  │    │
+│  │    are ALREADY applied automatically:                │    │
+│  │                                                      │    │
+│  │    TIER 1 (Universal — always on):                   │    │
+│  │    ✓ PII detection & redaction                       │    │
+│  │    ✓ Prompt injection defense                        │    │
+│  │    ✓ Content toxicity filter                         │    │
+│  │    ✓ Audit logging                                   │    │
+│  │                                                      │    │
+│  │    TIER 2 (Commercial Banking domain — always on):   │    │
+│  │    ✓ Fair lending compliance checker                  │    │
+│  │    ✓ Credit decision boundary enforcer               │    │
+│  │    ✓ Regulatory language filter (ECOA, UDAAP)        │    │
+│  │                                                      │    │
+│  │    You cannot remove these. You will now configure    │    │
+│  │    additional guardrails specific to YOUR use case.   │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  [ Next → ]                                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Form Section 2: What Should This Tool Be Used For?
+
+This maps to module **IN-01: Topic Scope Restrictor**. But the business user just sees a plain-English question.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  WHAT SHOULD THIS TOOL BE USED FOR?                          │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  Describe what this tool is supposed to do (in plain         │
+│  English). The system will restrict the tool to only         │
+│  respond to requests related to these topics.                │
+│                                                              │
+│  What topics should this tool handle? (check all that apply) │
+│                                                              │
+│  ☑  Credit memo summarization                                │
+│  ☑  Financial statement analysis                             │
+│  ☐  Credit decisioning                                       │
+│  ☐  Loan pricing                                             │
+│  ☐  General Q&A / open-ended chat                            │
+│  ☐  Customer communication drafting                          │
+│  [+ Add custom topic: _________________________ ]            │
+│                                                              │
+│  What should this tool NOT do? (check all that apply)        │
+│                                                              │
+│  ☑  Make or imply credit decisions                           │
+│  ☑  Provide pricing or rate quotes                           │
+│  ☑  Give personal financial advice                           │
+│  ☐  Draft customer-facing communications                     │
+│  [+ Add custom restriction: ___________________ ]            │
+│                                                              │
+│  When someone asks an off-topic question, what message       │
+│  should they see?                                            │
+│                                                              │
+│  [ This tool only summarizes credit memos. Please contact  ] │
+│  [ your credit officer for other requests.                 ] │
+│                                                              │
+│  [ ← Back ]  [ Next → ]                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Form Section 3: What Data Sources Can the Tool Use?
+
+This maps to module **SYS-02: Knowledge Boundary Setter**.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  WHAT DATA SOURCES CAN THE TOOL USE?                         │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  Select the approved data sources this tool can reference    │
+│  when generating responses. The tool will ONLY use these     │
+│  sources — it will not make up information from other        │
+│  sources.                                                    │
+│                                                              │
+│  Available data sources for your domain:                     │
+│                                                              │
+│  ☑  Credit memo corpus                                       │
+│  ☑  Financial policy documents                               │
+│  ☐  Customer account database                                │
+│  ☐  Market data feeds                                        │
+│  ☐  Internal procedures & guidelines                         │
+│  ☐  Regulatory reference library                             │
+│                                                              │
+│  Must the tool cite its sources in every response?           │
+│                                                              │
+│  ● Yes — require a citation for every claim  (Recommended   │
+│          for HIGH risk use cases)                             │
+│  ○ No  — citations are optional                              │
+│                                                              │
+│  [ ← Back ]  [ Next → ]                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Form Section 4: How Accurate Must the Responses Be?
+
+This maps to module **OUT-02: Factual Grounding Checker**.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  HOW ACCURATE MUST THE RESPONSES BE?                         │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  This controls how strictly the tool checks that its         │
+│  responses are supported by the source documents.            │
+│                                                              │
+│  Set the accuracy threshold:                                 │
+│                                                              │
+│  ○ Standard (70%) — Allows more flexible responses, but      │
+│    some claims may not be directly traceable to sources.     │
+│    Best for: brainstorming, exploratory analysis.            │
+│                                                              │
+│  ● Strict (85%) — Most claims must be directly supported     │
+│    by source documents. Good balance of accuracy and         │
+│    usefulness. (Recommended for HIGH risk)                   │
+│                                                              │
+│  ○ Very Strict (95%) — Nearly every claim must be directly   │
+│    quoted or paraphrased from sources. May refuse to         │
+│    answer if sources are insufficient.                       │
+│    Best for: regulatory, legal, or audit-sensitive tasks.    │
+│                                                              │
+│  When a response falls below the accuracy threshold,         │
+│  what should happen?                                         │
+│                                                              │
+│  ○ Block the response entirely                               │
+│  ● Flag it for human review before delivering                │
+│  ○ Deliver it with a warning label                           │
+│                                                              │
+│  [ ← Back ]  [ Next → ]                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Form Section 5: Does a Human Need to Review Responses?
+
+This maps to module **OPS-02: Human-in-the-Loop Gate**.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  DOES A HUMAN NEED TO REVIEW RESPONSES?                      │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ ⚠  Because your use case is rated HIGH risk, at      │    │
+│  │    least one human review trigger is REQUIRED.        │    │
+│  │    You cannot skip this section.                      │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  When should a human review the tool's response before       │
+│  the user sees it?                                           │
+│                                                              │
+│  ○ Always — every response is reviewed by a human            │
+│  ● When confidence is low — only when the tool is less       │
+│    than [ 70 ]% confident in its response                    │
+│  ○ When a guardrail is triggered — only when the tool        │
+│    flags a potential issue                                    │
+│                                                              │
+│  Who should review?                                          │
+│                                                              │
+│  Role:  [ Credit Analyst          ▼ ]                        │
+│                                                              │
+│  If no reviewer responds within [ 4 ] hours:                 │
+│                                                              │
+│  ○ Escalate to their manager                                 │
+│  ● Escalate to the domain risk lead                          │
+│  ○ Hold until reviewed (no time limit)                       │
+│                                                              │
+│  [ ← Back ]  [ Next → ]                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Form Section 6: Output Style and Disclaimers
+
+This maps to modules **OUT-06: Output Format Enforcer** and **OUT-04: Confidence Qualifier**.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  OUTPUT STYLE AND DISCLAIMERS                                │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  What format should the tool's responses be in?              │
+│                                                              │
+│  ☑  Plain text (paragraphs)                                  │
+│  ☑  Bullet points                                            │
+│  ☐  Structured table                                         │
+│  ☐  JSON (for system integrations)                           │
+│                                                              │
+│  Maximum response length:                                    │
+│                                                              │
+│  ○ Short (up to 100 words)                                   │
+│  ● Medium (up to 300 words)                                  │
+│  ○ Long (up to 800 words)                                    │
+│  ○ No limit                                                  │
+│                                                              │
+│  Should every response include a disclaimer?                 │
+│                                                              │
+│  ● Yes                                                       │
+│  ○ No                                                        │
+│                                                              │
+│  Disclaimer text:                                            │
+│  [ This summary is auto-generated and must be reviewed     ] │
+│  [ by a credit officer before use in any credit decision.  ] │
+│                                                              │
+│  [ ← Back ]  [ Next → ]                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Form Section 7: Emergency Controls
+
+This maps to module **OPS-05: Kill Switch**.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  EMERGENCY CONTROLS                                          │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  If something goes seriously wrong, who can shut this        │
+│  tool down immediately?                                      │
+│                                                              │
+│  Primary kill switch owner:                                  │
+│                                                              │
+│  Name:  [ J. Smith                              ]            │
+│  Role:  [ VP, Commercial Lending                ]            │
+│  Email: [ j.smith@bank.com                      ]            │
+│                                                              │
+│  Backup kill switch owner:                                   │
+│                                                              │
+│  Name:  [ M. Johnson                            ]            │
+│  Role:  [ SVP, Commercial Banking Risk          ]            │
+│  Email: [ m.johnson@bank.com                    ]            │
+│                                                              │
+│  Should the tool also shut down automatically if errors      │
+│  exceed a threshold?                                         │
+│                                                              │
+│  ● Yes — shut down if error rate exceeds [ 10 ]% in a       │
+│    [ 1-hour ] window                                         │
+│  ○ No — manual shutdown only                                 │
+│                                                              │
+│  Message to show users when the tool is shut down:           │
+│                                                              │
+│  [ This tool is temporarily unavailable. Please contact    ] │
+│  [ the Commercial Lending team for assistance.             ] │
+│                                                              │
+│  [ ← Back ]  [ Next → ]                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Form Section 8: Review and Submit
+
+After filling out all sections, the business user sees a plain-English summary of everything they configured. No technical jargon, no YAML, no module IDs.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  REVIEW YOUR GUARDRAIL CONFIGURATION                         │
+│  ─────────────────────────────────────────────────────────── │
+│                                                              │
+│  Use Case: Commercial Lending - Credit Memo Summarizer       │
+│  Risk Tier: HIGH                                             │
+│                                                              │
+│  ── ALREADY APPLIED (you cannot change these) ──────────── │
+│                                                              │
+│  ✓ PII is automatically detected and redacted                │
+│  ✓ Prompt injection attacks are blocked                      │
+│  ✓ Toxic content is filtered                                 │
+│  ✓ All interactions are logged for audit                     │
+│  ✓ Fair lending compliance is enforced                       │
+│  ✓ Credit decision language is blocked                       │
+│                                                              │
+│  ── YOUR CONFIGURATION (Tier 3) ───────────────────────── │
+│                                                              │
+│  SCOPE: Tool will ONLY respond to questions about credit     │
+│  memo summarization and financial statement analysis.        │
+│  Off-topic requests receive: "This tool only summarizes      │
+│  credit memos. Please contact your credit officer."          │
+│                                                              │
+│  DATA SOURCES: Credit memo corpus, financial policy docs.    │
+│  Citations are required in every response.                   │
+│                                                              │
+│  ACCURACY: 85% of claims must be supported by source docs.   │
+│  Responses below threshold are flagged for human review.     │
+│                                                              │
+│  HUMAN REVIEW: Required when confidence is below 70%.        │
+│  Reviewer: Credit Analyst. Escalation after 4 hours to       │
+│  domain risk lead.                                           │
+│                                                              │
+│  OUTPUT: Plain text or bullet points, up to 300 words.       │
+│  Every response includes: "This summary is auto-generated    │
+│  and must be reviewed by a credit officer before use in      │
+│  any credit decision."                                       │
+│                                                              │
+│  EMERGENCY: Kill switch held by J. Smith (primary) and       │
+│  M. Johnson (backup). Auto-shutdown if error rate > 10%      │
+│  in 1 hour.                                                  │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ This configuration will be sent to your domain risk  │    │
+│  │ lead for review (required for HIGH risk use cases).  │    │
+│  │ You will be notified when it is approved.            │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  [ ← Back to Edit ]          [ Submit for Review → ]        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### What Happens After the Business User Clicks "Submit"
+
+The business user's job is done after they submit the form. Here is what happens next, and who is responsible for each step:
+
+```
+Business User clicks "Submit for Review"
+         │
+         ▼
+┌─────────────────────────────────────────────┐
+│  TRANSLATION ENGINE (automated)              │
+│                                              │
+│  1. Converts form answers into technical     │
+│     guardrail config (YAML/JSON)             │
+│  2. Merges with Tier 1 + Tier 2 configs      │
+│  3. Validates: all required modules present?  │
+│  4. Validates: parameters within allowed      │
+│     ranges?                                   │
+│  5. If validation fails → sends form back     │
+│     to business user with specific guidance   │
+│     (e.g., "HIGH risk requires human review   │
+│     — please complete Section 5")             │
+└──────────────────┬──────────────────────────┘
+                   │ Validation passes
+                   ▼
+┌─────────────────────────────────────────────┐
+│  APPROVAL WORKFLOW (human reviewers)         │
+│                                              │
+│  Reviewer receives:                          │
+│  • The plain-English summary (same as what   │
+│    the business user saw)                    │
+│  • The generated technical config            │
+│  • The risk assessment scores                │
+│  • Flags or warnings from the validation     │
+│    engine                                    │
+│                                              │
+│  Reviewer can:                               │
+│  • Approve as-is                             │
+│  • Approve with modifications (reviewer      │
+│    adjusts parameters)                       │
+│  • Reject with comments (sends back to       │
+│    business user with feedback)              │
+└──────────────────┬──────────────────────────┘
+                   │ Approved
+                   ▼
+┌─────────────────────────────────────────────┐
+│  DEPLOYMENT (platform team, automated)       │
+│                                              │
+│  1. Config is version-controlled (Git)       │
+│  2. Config is deployed to guardrail engine   │
+│  3. Pre-deployment automated tests run       │
+│  4. Monitoring & alerting activated          │
+│  5. Business user notified: "Your use case   │
+│     is live"                                 │
+└─────────────────────────────────────────────┘
+```
+
+### How Each Form Question Maps to a Technical Module
+
+For those who want to understand the connection between what the business user sees and the underlying technical system, here is the mapping:
+
+| Form Section (What Business User Sees) | Technical Module (What the System Creates) | Who Built the Module |
+|---|---|---|
+| "What should this tool be used for?" | IN-01: Topic Scope Restrictor | Platform team |
+| "What data sources can the tool use?" | SYS-02: Knowledge Boundary Setter | Platform team |
+| "How accurate must responses be?" | OUT-02: Factual Grounding Checker | Platform team |
+| "Does a human need to review responses?" | OPS-02: Human-in-the-Loop Gate | Platform team |
+| "Output style and disclaimers" | OUT-06: Output Format Enforcer + OUT-04: Confidence Qualifier | Platform team |
+| "Emergency controls" | OPS-05: Kill Switch | Platform team |
+
+The platform team builds each module once. The business user configures it many times across many use cases — without ever touching the module's code.
+
+### Smart Defaults and Safety Nets
+
+The portal does not just present blank forms. It includes several mechanisms to help non-technical users make good choices and prevent dangerous configurations.
+
+#### 1. Risk-Tier-Based Smart Defaults
+
+When a business user opens the portal, the form is **pre-filled with recommended defaults** based on their risk tier. They can adjust these but cannot go below the minimum.
+
+| Setting | LOW Default | MEDIUM Default | HIGH Default | CRITICAL Default |
+|---|---|---|---|---|
+| Accuracy threshold | 70% | 75% | 85% | 95% |
+| Human review | Not required | Optional | Required (when confidence is low) | Required (always) |
+| Citations | Optional | Recommended | Required | Required |
+| Auto-shutdown on errors | Off | Off | On (10% threshold) | On (5% threshold) |
+| Response length limit | No limit | 500 words | 300 words | 200 words |
+
+#### 2. Mandatory Fields by Risk Tier
+
+The portal enforces **minimum guardrail requirements** per risk tier. Some form sections cannot be skipped.
+
+| Risk Tier | Mandatory Form Sections |
+|---|---|
+| LOW | Scope (Section 2), Emergency contacts (Section 7) |
+| MEDIUM | Scope, Data sources (Section 3), Emergency controls |
+| HIGH | ALL sections are mandatory |
+| CRITICAL | ALL sections mandatory + additional fields for red team testing plan, incident response plan |
+
+If a business user tries to submit without completing a required section, the portal blocks submission and shows a clear message:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ⚠  Cannot submit: your use case is rated HIGH risk.        │
+│                                                              │
+│  The following required sections are incomplete:             │
+│                                                              │
+│  • Section 5: "Does a human need to review responses?"       │
+│    → HIGH risk use cases require at least one human          │
+│      review trigger. Please complete this section.           │
+│                                                              │
+│  • Section 3: "What data sources can the tool use?"          │
+│    → You must select at least one approved data source.      │
+│                                                              │
+│  [ Go to Section 5 ]    [ Go to Section 3 ]                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 3. Guided Tooltips and Explanations
+
+Every form field has a "What does this mean?" tooltip written in plain English with concrete examples from banking. For instance:
+
+```
+  Accuracy threshold:  ● Strict (85%)
+
+      ┌──────────────────────────────────────────────┐
+      │  ℹ  What does 85% accuracy mean?              │
+      │                                               │
+      │  If the tool generates a summary with 10       │
+      │  factual claims, at least 8-9 of them must     │
+      │  be directly supported by the source credit    │
+      │  memo. If fewer than 85% are supported, the    │
+      │  response is flagged for human review.         │
+      │                                               │
+      │  Example: If the tool says "Revenue grew 12%"  │
+      │  but the memo says 10%, that claim fails the   │
+      │  grounding check.                              │
+      └──────────────────────────────────────────────┘
+```
+
+#### 4. Conflict Detection
+
+The portal checks for contradictions in the business user's configuration and alerts them:
+
+| Conflict | Portal Response |
+|---|---|
+| User selected "No human review" but risk tier is HIGH | "HIGH risk use cases require human review. Please select a review trigger." |
+| User set accuracy to 70% but selected "regulatory reference library" as a data source | "Caution: When using regulatory data, we recommend at least 85% accuracy to avoid compliance risks. Would you like to increase it?" |
+| User checked "credit decisioning" in both allowed AND blocked topics | "You selected credit decisioning as both an allowed and blocked topic. Please resolve this conflict." |
+
+### Frequently Asked Questions from Business Teams
+
+**Q: Do I need to know what YAML or JSON is?**
+A: No. You will never see YAML, JSON, or any code. You fill out forms with checkboxes, dropdowns, and text fields. The system handles the rest.
+
+**Q: What if I don't know which options to pick?**
+A: The form pre-fills recommended defaults based on your risk tier. If you are unsure about a specific field, click the "What does this mean?" tooltip for a plain-English explanation. You can also contact the platform team's support channel for help.
+
+**Q: Can I accidentally break something or create a security hole?**
+A: No. The portal has multiple safety nets:
+- Tier 1 guardrails (PII protection, toxicity filters, etc.) are always on and cannot be turned off from the portal
+- Tier 2 domain guardrails are always on and cannot be weakened
+- The portal enforces minimum requirements for your risk tier
+- A human reviewer (risk lead or 2nd Line) reviews your configuration before it goes live
+- You can only make your guardrails **stricter** than the defaults, never weaker
+
+**Q: How long does the process take from form submission to the tool going live?**
+A: This depends on the approval workflow, which varies by risk tier and your organization's capacity. The form itself can be completed in a single sitting. After submission, the review and deployment process follows the timelines set by your governance team.
+
+**Q: Can I change my configuration after the tool is live?**
+A: Yes. Return to the portal, make changes, and resubmit. Changes go through the same review and approval process. All changes are version-controlled, so there is a full audit trail of what changed, when, and who approved it.
+
+**Q: What if my use case doesn't fit neatly into the form options?**
+A: Every form section includes an "Add custom" option for topics, restrictions, and other fields. If your needs are truly unique, the platform team can work with you to create a custom guardrail module and add it to the library for future reuse.
+
+### Summary: Who Does What
+
+| Person | What They Do | Technical Skill Required |
+|---|---|---|
+| **Platform / Tech Team** | Builds the portal, builds the guardrail modules, maintains the translation engine, deploys configs, runs the infrastructure | High — software engineering |
+| **Domain Risk Lead** | Defines Tier 2 domain guardrail requirements, reviews MEDIUM+ configurations, maintains domain templates | Medium — risk expertise, no coding |
+| **Business Use Case Owner** | Fills out the form, selects options, writes plain-English descriptions, submits for review, monitors their use case | **None — just fill out the form** |
+| **2nd Line Risk** | Reviews HIGH/CRITICAL configurations, challenges risk assessments, monitors enterprise metrics | Medium — risk expertise, no coding |
+
+The entire point of this architecture is captured in one sentence: **the platform team builds it once, and business teams configure it forever — without writing a single line of code.**
+
+---
+
+## 7. Risk Assessment Framework
 
 ### What Is It?
 
@@ -602,11 +1206,11 @@ Why? A use case could score 1 on five dimensions but 5 on "Regulatory Exposure" 
 
 ---
 
-## 7. Governance Process
+## 8. Governance Process
 
 ### End-to-End Process Flow
 
-This is the step-by-step process for taking a GenAI use case from idea to production with proper risk governance.
+This is the step-by-step process for taking a GenAI use case from idea to production with proper risk governance. Note: Step 5 is where the Tier 3 Self-Service Portal (Section 6) fits in — the business user fills out the forms described there.
 
 ```
 Step 1: USE CASE REGISTRATION
@@ -630,10 +1234,11 @@ Step 4: RISK TIER ASSIGNMENT
 │  and assigns the risk tier (Low / Medium / High / Critical)
 │
 ▼
-Step 5: GUARDRAIL MAPPING
+Step 5: GUARDRAIL MAPPING (via Tier 3 Self-Service Portal)
 │  System auto-applies Tier 1 + Tier 2 modules for the domain.
-│  Presents required and recommended Tier 3 modules based
-│  on risk tier. Owner configures parameters.
+│  Business user opens the Self-Service Portal (Section 6),
+│  fills out the guided forms to configure Tier 3 guardrails.
+│  No coding required — just forms, dropdowns, and checkboxes.
 │
 ▼
 Step 6: REVIEW & CHALLENGE
@@ -674,7 +1279,7 @@ Even after deployment, certain events should trigger a fresh risk assessment:
 
 ---
 
-## 8. Risk-Tiered Oversight
+## 9. Risk-Tiered Oversight
 
 ### Why Tiered Oversight?
 
@@ -718,7 +1323,7 @@ Watch for these warning signs when reviewing risk assessments:
 
 ---
 
-## 9. Continuous Improvement Loop
+## 10. Continuous Improvement Loop
 
 ### Why Continuous Improvement?
 
@@ -792,7 +1397,7 @@ Track these metrics at the enterprise, domain, and use case level:
 
 ---
 
-## 10. Roles and Responsibilities
+## 11. Roles and Responsibilities
 
 ### The Three Lines of Defense Applied to GenAI
 
@@ -818,7 +1423,7 @@ The platform team is not a "line of defense" but is a critical enabler:
 
 ---
 
-## 11. Summary
+## 12. Summary
 
 ### The Five Key Principles
 
